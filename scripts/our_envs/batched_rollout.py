@@ -67,6 +67,26 @@ ILLEGAL_PENALTY = 0.05
 # never swamp the +-1 terminal signal it is meant to sit under.
 MAX_ILLEGAL_PENALTY = 0.5
 
+def make_step_pool(num_servers: int) -> ThreadPoolExecutor:
+    """HTTP stepping pool, sized independently of the number of env servers.
+
+    ``shared_env.init_env_pool`` sizes its pool at one worker per server, which
+    was right when a worker owned a whole episode start-to-finish.  In the
+    cohort loop a worker only issues one HTTP step, so that sizing serialises
+    the entire batch whenever there is a single sidecar -- and the validator
+    starts roughly one sidecar per assigned GPU, so a one-GPU task gets exactly
+    one.  Each episode carries its own ``episode_id``, so concurrent steps
+    against one sidecar are independent requests.
+    """
+    try:
+        override = int(float(os.environ.get("STEP_WORKERS") or 0))
+    except (TypeError, ValueError):
+        override = 0
+    if override > 0:
+        return ThreadPoolExecutor(max_workers=override)
+    return ThreadPoolExecutor(max_workers=max(4, min(32, 8 * max(1, num_servers))))
+
+
 _LEGAL_LINE_RE = re.compile(r"^\s*(\d+)\s*->", re.MULTILINE)
 
 
@@ -657,13 +677,15 @@ class BoardGameEnv:
 
         print(
             f"[{self.spec.name}] pool ready: {num_servers} server(s), "
-            f"league={[o.key for o in league.opponents]}, gen_chunk={self.gen_chunk}"
+            f"league={[o.key for o in league.opponents]}, gen_chunk={self.gen_chunk}, "
+            f"step_workers={step_pool._max_workers}"
         )
+        step_pool = make_step_pool(num_servers)
         self._state.update(
             initialized=True,
             rank=rank,
             env_pool=env_pool,
-            thread_pool=thread_pool,
+            thread_pool=step_pool,
             semaphore=semaphore,
             league=league,
         )

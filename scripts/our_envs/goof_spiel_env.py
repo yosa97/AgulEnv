@@ -7,6 +7,7 @@ from trl.experimental.openenv import generate_rollout_completions
 from our_envs.batched_rollout import (
     GameHooks,
     GameSpec,
+    make_step_pool,
     pack_results,
     run_cohort,
     run_forced_turn_cohort,
@@ -240,7 +241,14 @@ def _ensure_initialized(trainer) -> None:
     )
 
     league = OpponentLeague.from_sims_ladder({"opponent": "mcts", "mcts_num_rollouts": 1})
-    print(f"[goofspiel] league={[o.key for o in league.opponents]}")
+    # The pool from init_env_pool has one worker per env server; in the cohort
+    # loop a worker only issues one HTTP step, so a single sidecar would
+    # serialise the whole batch.  See batched_rollout.make_step_pool.
+    thread_pool = make_step_pool(num_servers)
+    print(
+        f"[goofspiel] league={[o.key for o in league.opponents]}, "
+        f"servers={num_servers}, step_workers={thread_pool._max_workers}"
+    )
 
     _state.update(
         initialized=True,
