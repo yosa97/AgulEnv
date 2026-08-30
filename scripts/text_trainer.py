@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import copy
 import json
+import codecs
 import os
 import re
 import shutil
@@ -45,22 +46,49 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
         if env_vars:
             process_env.update(env_vars)
 
-        # Run the command, capturing stdout and stderr
+        # Run the command, capturing stdout and stderr.
+        #
+        # Binary, unbuffered, read in CHUNKS. The previous reader opened the pipe
+        # in TEXT mode and iterated it line by line, which applies Python's
+        # universal-newline translation: every "\r" becomes "\n". A tqdm
+        # progress bar (HF Trainer's "  3%|## | 12/369") redraws itself by
+        # returning the carriage and rewriting the same line, so that
+        # translation turned each redraw into a separate console line -- the bar
+        # never animated, it just scrolled, and on a long run it buried the
+        # actual log. Reading bytes and forwarding them verbatim keeps the
+        # carriage returns, so the bar behaves like a bar.
         process = subprocess.Popen(
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            bufsize=0,
             env=process_env,
         )
 
-        # Stream output to both console and log file
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log_file.write(line)
+        # Stream output to both console and log file, preserving \r so the bar
+        # animates in place on the console. The log FILE gets \r rewritten to
+        # \n instead, so it stays greppable rather than collapsing every bar
+        # redraw onto one unreadable line.
+        stdout_fd = process.stdout.fileno()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while True:
+            chunk = os.read(stdout_fd, 8192)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            if not text:
+                continue
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            log_file.write(text.replace("\r", "\n"))
             log_file.flush()
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            sys.stdout.write(tail)
+            sys.stdout.flush()
+            log_file.write(tail.replace("\r", "\n"))
+        process.stdout.close()
 
         # Wait for the process to complete
         return_code = process.wait()
