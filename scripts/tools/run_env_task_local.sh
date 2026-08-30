@@ -65,6 +65,26 @@ SIDECAR="${SIDECAR:-mcts-api-$PRIMARY_GAME}"
 MCTS_IMAGE="${MCTS_IMAGE:-gradientsio/mcts-api:latest}"
 TRAINER_IMAGE="${TRAINER_IMAGE:-agulenv-trainer}"
 
+# Knobs the trainer reads INSIDE the container. Exporting one on the host does
+# nothing unless it is forwarded here -- `docker run -e NAME` (no value) passes
+# the host's value through. Anything unset is skipped, so this stays a no-op
+# until you actually set one.
+PASSTHROUGH_ENV=(
+    SFT_TARGET_PER_ENV SFT_MAX_UPSAMPLE            # merge balancing
+    GOOFSPIEL_OUTCOME_WEIGHT GOOFSPIEL_NEAR_MISS GOOFSPIEL_STRATEGY_WEIGHT
+    LEAGUE_SIMS_LADDER LEAGUE_TARGET_WIN_RATE LEAGUE_BAND_WIDTH
+    PVP_MOVE_ENCODING GEN_INPROCESS_MCTS SELFPLAY_DISABLE
+    SWE_EPOCHS SWE_MAX_LENGTH
+    TRL_EXPERIMENTAL_SILENCE
+)
+ENV_FLAGS=()
+for _v in "${PASSTHROUGH_ENV[@]}"; do
+    if [ -n "${!_v-}" ]; then
+        ENV_FLAGS+=(-e "$_v")
+        echo "    forwarding $_v=${!_v}"
+    fi
+done
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHECKPOINTS_DIR="$REPO_ROOT/secure_checkpoints"
 OUTPUTS_DIR="$REPO_ROOT/outputs"
@@ -175,6 +195,7 @@ docker run --rm --gpus all --network "$NET" \
     --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
     -e ENVIRONMENT_SERVER_URLS="$ENV_URL" \
     -e GEN_CHUNK="$GEN_CHUNK" -e STEP_WORKERS="$STEP_WORKERS" \
+    "${ENV_FLAGS[@]}" \
     -e HUGGINGFACE_TOKEN="$HF_TOKEN" -e HUGGINGFACE_USERNAME="$HF_USER" \
     -e WANDB_TOKEN="$WANDB_TOKEN" \
     --name "env-task-$PRIMARY_GAME" \
