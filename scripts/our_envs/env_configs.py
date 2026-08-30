@@ -36,6 +36,16 @@ from our_envs.alf_world_env import (
     alfworld_rollout_full_prompt_and_completion_parallelized  as _alf_rollout_full,
     alfworld_rollout_reward_func                              as _alf_reward,
 )
+from our_envs.clobber_env import (
+    rollout_full_prompt_and_completion_parallelized_curriculum as _clobber_rollout_full,
+    rollout_last_prompt_and_completion_parallelized_curriculum as _clobber_rollout_last,
+    rollout_reward_func                                        as _clobber_reward,
+)
+from our_envs.othello_env import (
+    rollout_full_prompt_and_completion_parallelized_curriculum as _othello_rollout_full,
+    rollout_last_prompt_and_completion_parallelized_curriculum as _othello_rollout_last,
+    rollout_reward_func                                        as _othello_reward,
+)
 from our_envs.gin_rummy_env import (
     rollout_full_prompt_and_completion_parallelized_curriculum as _gin_rollout_full,
     rollout_last_prompt_and_completion_parallelized_curriculum as _gin_rollout_last,
@@ -254,6 +264,31 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         num_generations=8,
         temperature=2.0,
         top_k=5,
+    ),
+    # Board games: whole-game rollouts through the batched cohort engine, with
+    # an opponent league in place of a fixed MCTS budget.  No curriculum_factory
+    # -- the league adapts opponent strength, which is the curriculum that
+    # matters here; truncating a board game by turn count would just remove the
+    # terminal result these rewards are built on.
+    "othello": EnvTrainingConfig(
+        rollout_full=_othello_rollout_full,
+        rollout_last=_othello_rollout_last,
+        reward_func=_othello_reward,
+        vllm_max_model_length=9216,
+        num_generations=8,
+        reasoning=ModeConfig(max_completion_length=2048),
+        no_mask=ModeConfig(max_completion_length=24),
+        full_prompt=ModeConfig(max_completion_length=24),
+    ),
+    "clobber": EnvTrainingConfig(
+        rollout_full=_clobber_rollout_full,
+        rollout_last=_clobber_rollout_last,
+        reward_func=_clobber_reward,
+        vllm_max_model_length=9216,
+        num_generations=8,
+        reasoning=ModeConfig(max_completion_length=2048),
+        no_mask=ModeConfig(max_completion_length=24),
+        full_prompt=ModeConfig(max_completion_length=24),
     ),
     "alfworld": EnvTrainingConfig(
         rollout_full=_alf_rollout_full,
