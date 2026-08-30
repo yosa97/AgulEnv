@@ -34,6 +34,7 @@ illegal-move handling, terminal scoring — lives here.
 
 from __future__ import annotations
 
+import os
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -51,7 +52,13 @@ _TIMEOUT = 2400
 
 # Cap on prompts handed to one generation call.  Large enough to be a real
 # batch, small enough that a long-context game does not blow the KV cache.
-DEFAULT_GEN_CHUNK = 32
+# vLLM will schedule an oversized batch in waves rather than fail, but on a
+# single GPU a smaller chunk keeps the KV cache within the slice
+# ``vllm_gpu_memory_utilization`` reserved for it.
+try:
+    DEFAULT_GEN_CHUNK = max(1, int(float(os.environ.get("GEN_CHUNK") or 16)))
+except (TypeError, ValueError):
+    DEFAULT_GEN_CHUNK = 16
 
 # Penalty per illegal action.  Deliberately small next to the +-1 terminal
 # signal: the audit's own lesson is that shaping must never outweigh winning.
@@ -157,6 +164,8 @@ class _Episode:
     opponent_payload: dict = field(default_factory=dict)
     obs_transform: "Callable[[str], str] | None" = None
     stats: dict = field(default_factory=dict)
+    coasting: bool = False
+    coasted_turns: int = 0
 
     turn: int = 0
     done: bool = False
@@ -339,21 +348,27 @@ def run_cohort(
         if not live:
             break
 
-        outputs = batched_generate(
-            trainer, [ep.messages for ep in live], generation_semaphore, gen_chunk
+        # An episode whose prompt outgrew the context window stops generating
+        # but keeps PLAYING, on random legal moves, so the tokens already
+        # collected still end up attached to a real terminal result.  Dropping
+        # it instead would silently discard most long games -- othello runs ~60
+        # plies, well past any prompt budget that fits on one GPU.
+        gen_set = [ep for ep in live if not ep.coasting]
+        outputs = (
+            batched_generate(trainer, [ep.messages for ep in gen_set], generation_semaphore, gen_chunk)
+            if gen_set else []
         )
 
-        actions: list = []
-        for ep, out in zip(live, outputs):
+        chosen: dict = {}
+        for ep, out in zip(gen_set, outputs):
             prompt_ids = out.get("prompt_ids", [])
             completion_ids = out.get("completion_ids", [])
             logprobs = out.get("logprobs", [])
 
             if len(prompt_ids) > spec.max_prompt_len:
-                print(f"[{spec.name}] prompt over {spec.max_prompt_len} tokens at turn {turn}; ending episode")
-                ep.done = True
-                ep.failed = True
-                actions.append(None)
+                if not ep.coasting:
+                    print(f"[{spec.name}] prompt over {spec.max_prompt_len} tokens at turn {turn}; coasting to terminal")
+                ep.coasting = True
                 continue
 
             completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
@@ -375,15 +390,22 @@ def run_cohort(
                 # result still means something, but never substitute the expert
                 # move — that would reward an illegal completion with good play.
                 action_id = ep.rng.choice(legal) if legal else None
-            actions.append(action_id)
+            chosen[id(ep)] = action_id
 
-        step_pairs = [
-            (ep, str(a)) for ep, a in zip(live, actions) if a is not None and not ep.failed
-        ]
-        for ep, a in zip(live, actions):
-            if a is None and not ep.failed:
+        for ep in live:
+            if ep.coasting:
+                legal = legal_ids_from_observation(ep.observation)
+                chosen[id(ep)] = ep.rng.choice(legal) if legal else None
+                ep.coasted_turns += 1
+
+        step_pairs = []
+        for ep in live:
+            action = chosen.get(id(ep))
+            if action is None:
                 ep.failed = True
                 ep.done = True
+            else:
+                step_pairs.append((ep, str(action)))
         list(thread_pool.map(lambda pair: _step_episode(pair[0], spec, pair[1]), step_pairs))
 
         for ep in live:
@@ -413,6 +435,7 @@ def run_cohort(
                 "outcome": outcome,
                 "illegal": ep.illegal_count,
                 "turns": ep.turn,
+                "coasted": ep.coasted_turns,
             }
         else:
             if not ep.last_completion_ids:
@@ -461,7 +484,8 @@ def summarise(results: list, name: str, league: OpponentLeague) -> None:
         f"[{name}] finished={len(valid)}/{len(results)} win={wins:.1%} "
         f"avg_reward={sum(r['reward'] for r in valid) / len(valid):.3f} "
         f"avg_turns={sum(r['turns'] for r in valid) / len(valid):.1f} "
-        f"illegal/ep={sum(r['illegal'] for r in valid) / len(valid):.2f}"
+        f"illegal/ep={sum(r['illegal'] for r in valid) / len(valid):.2f} "
+        f"coasted/ep={sum(r.get('coasted', 0) for r in valid) / len(valid):.1f}"
     )
     print(league.format_status())
 
