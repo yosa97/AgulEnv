@@ -88,12 +88,33 @@ def parse_action_id(completion_text: str) -> "int | None":
         return None
 
 
+class GameHooks:
+    """Per-game scoring, plugged into the generic cohort loop.
+
+    The engine knows about terminal results and illegal actions; anything a
+    specific game wants to observe or shape on lives here.  The default is
+    outcome-only, which is what a pure win/loss board game wants.
+    """
+
+    def on_turn(self, ep: "_Episode", observation: str, action_id, legal_ids: list, illegal: bool) -> None:
+        """Called once per model turn, before the env is stepped."""
+
+    def episode_reward(self, ep: "_Episode", outcome: float) -> float:
+        """Called once when the episode reaches a terminal state.
+
+        ``outcome`` is the env result normalised to [-1, 1].
+        """
+        return outcome - min(ILLEGAL_PENALTY * float(ep.illegal_count), MAX_ILLEGAL_PENALTY)
+
+
 @dataclass
 class GameSpec:
     """Everything the engine needs to know about one game."""
 
     name: str
-    system_prompt: str
+    # A string, or a zero-arg callable resolved per episode -- goofspiel's
+    # curriculum decides per episode whether the strategy hint is attached.
+    system_prompt: "str | Callable[[], str]"
     # Builds a FRESH raw-observation -> prompt-body transform per episode.
     # A factory, not a shared callable: othello's transform remembers which
     # colour the agent is playing so it can still label the terminal
@@ -106,6 +127,8 @@ class GameSpec:
     # Longest prompt we will keep feeding back before abandoning the episode.
     max_prompt_len: int = 8192
     max_episode_tokens: int = 16384
+    # Per-game scoring; the default is outcome minus illegal penalties.
+    hooks: GameHooks = field(default_factory=lambda: GameHooks())
 
 
 @dataclass
@@ -133,6 +156,7 @@ class _Episode:
     last_logprobs: list = field(default_factory=list)
     opponent_payload: dict = field(default_factory=dict)
     obs_transform: "Callable[[str], str] | None" = None
+    stats: dict = field(default_factory=dict)
 
     turn: int = 0
     done: bool = False
@@ -170,8 +194,9 @@ def _reset_episode(ep: _Episode, spec: GameSpec, opponent_payload: dict) -> None
         ep.done = True
         return
 
+    system_prompt = spec.system_prompt() if callable(spec.system_prompt) else spec.system_prompt
     ep.messages = [
-        {"role": "system", "content": spec.system_prompt},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": ep.observation},
     ]
 
@@ -342,7 +367,9 @@ def run_cohort(
 
             legal = legal_ids_from_observation(ep.observation)
             action_id = parse_action_id(completion_text)
-            if action_id is None or (legal and action_id not in legal):
+            illegal = action_id is None or (legal and action_id not in legal)
+            spec.hooks.on_turn(ep, ep.observation, action_id, legal, illegal)
+            if illegal:
                 ep.illegal_count += 1
                 # Keep the game alive on a legal substitute so the terminal
                 # result still means something, but never substitute the expert
@@ -369,9 +396,7 @@ def run_cohort(
             continue  # never finished: no honest outcome to train on
         outcome = _normalize_terminal(ep.terminal_raw)
         league.record(ep.opponent_key, max(0.0, min(1.0, (outcome + 1.0) / 2.0)))
-        reward = outcome - min(
-            ILLEGAL_PENALTY * float(ep.illegal_count), MAX_ILLEGAL_PENALTY
-        )
+        reward = spec.hooks.episode_reward(ep, outcome)
 
         if use_full_prompt:
             completion_ids = ep.completion_ids[: spec.max_episode_tokens]
@@ -440,6 +465,147 @@ def summarise(results: list, name: str, league: OpponentLeague) -> None:
     )
     print(league.format_status())
 
+
+
+def run_forced_turn_cohort(
+    prompts: list,
+    trainer,
+    spec: GameSpec,
+    league: OpponentLeague,
+    env_pool: list,
+    thread_pool: ThreadPoolExecutor,
+    generation_semaphore: Semaphore,
+    rank: int,
+    target_turn: int,
+    forcing_action: Callable[[str], "int | None"],
+    score_fn: Callable[["_Episode", str, "int | None", list, bool, "float | None"], float],
+    gen_chunk: int = DEFAULT_GEN_CHUNK,
+    playout: bool = True,
+) -> list:
+    """Strategy-forcing rollout, batched.
+
+    The episode is driven by ``forcing_action`` for ``target_turn`` turns, the
+    model plays exactly one turn, and the rest of the game is then played out by
+    the forcing policy so the turn has a real terminal result attached to it.
+
+    The forced phase and the playout are pure HTTP, so the whole batch needs
+    exactly ONE generation call — against one per episode in the loop this
+    replaces.
+    """
+    tokenizer = trainer.processing_class
+    num_servers = max(1, len(env_pool))
+
+    episodes: list[_Episode] = []
+    for i, prompt in enumerate(prompts):
+        game_id = int(prompt)
+        opponent = league.sample(random.Random(game_id))
+        ep = _Episode(
+            index=i,
+            game_id=game_id,
+            endpoint=env_pool[(i + rank) % num_servers]["base_url"],
+            opponent_key=opponent.key,
+            rng=random.Random(game_id),
+            obs_transform=spec.obs_transform_factory(),
+        )
+        ep.opponent_payload = opponent.payload
+        episodes.append(ep)
+
+    list(thread_pool.map(lambda e: _reset_episode(e, spec, e.opponent_payload), episodes))
+
+    # --- Forced phase: no generation at all -------------------------------
+    for _ in range(max(0, target_turn)):
+        live = [e for e in episodes if not e.done and not e.failed]
+        if not live:
+            break
+        pairs = []
+        for ep in live:
+            action = forcing_action(ep.observation)
+            if action is None:
+                ep.failed = True
+                ep.done = True
+                continue
+            ep.messages.append({"role": "assistant", "content": str(action)})
+            pairs.append((ep, str(action)))
+        list(thread_pool.map(lambda pr: _step_episode(pr[0], spec, pr[1]), pairs))
+        for ep, _ in pairs:
+            ep.turn += 1
+
+    # An episode that ended during forcing has no turn left to train on.
+    live = [e for e in episodes if not e.done and not e.failed]
+    if not live:
+        return [None] * len(prompts)
+
+    # --- The one generated turn -------------------------------------------
+    outputs = batched_generate(
+        trainer, [ep.messages for ep in live], generation_semaphore, gen_chunk
+    )
+
+    results: list = [None] * len(prompts)
+    finishers = []
+    for ep, out in zip(live, outputs):
+        prompt_ids = out.get("prompt_ids", [])
+        completion_ids = out.get("completion_ids", [])
+        logprobs = out.get("logprobs", [])
+        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+        ep.messages.append({"role": "assistant", "content": completion_text})
+
+        legal = legal_ids_from_observation(ep.observation)
+        action_id = parse_action_id(completion_text)
+        illegal = action_id is None or (legal and action_id not in legal)
+        if illegal:
+            ep.illegal_count += 1
+
+        ep.last_prompt_ids = list(prompt_ids)
+        ep.last_completion_ids = list(completion_ids)
+        ep.last_logprobs = list(logprobs)
+        ep.stats["observation"] = ep.observation
+        ep.stats["action_id"] = action_id
+        ep.stats["legal"] = legal
+        ep.stats["illegal"] = illegal
+        if playout and not illegal:
+            finishers.append(ep)
+
+    # --- Play the rest out with the forcing policy (HTTP only) ------------
+    def _finish(ep: _Episode) -> None:
+        action = str(ep.stats["action_id"])
+        for _ in range(spec.max_turn):
+            _step_episode(ep, spec, action)
+            if ep.done or ep.failed:
+                return
+            nxt = forcing_action(ep.observation)
+            if nxt is None:
+                ep.failed = True
+                ep.done = True
+                return
+            action = str(nxt)
+
+    if finishers:
+        list(thread_pool.map(_finish, finishers))
+
+    for ep in live:
+        if not ep.last_completion_ids:
+            continue
+        outcome = None if ep.terminal_raw is None else _normalize_terminal(ep.terminal_raw)
+        if outcome is not None:
+            league.record(ep.opponent_key, max(0.0, min(1.0, (outcome + 1.0) / 2.0)))
+        reward = score_fn(
+            ep,
+            ep.stats.get("observation", ""),
+            ep.stats.get("action_id"),
+            ep.stats.get("legal", []),
+            bool(ep.stats.get("illegal")),
+            outcome,
+        )
+        results[ep.index] = {
+            "prompt_ids": ep.last_prompt_ids,
+            "completion_ids": ep.last_completion_ids,
+            "logprobs": ep.last_logprobs,
+            "reward": reward,
+            "outcome": 0.0 if outcome is None else outcome,
+            "illegal": ep.illegal_count,
+            "turns": ep.turn,
+        }
+    return results
 
 class BoardGameEnv:
     """Ties a GameSpec to an env-server pool and an opponent league.
