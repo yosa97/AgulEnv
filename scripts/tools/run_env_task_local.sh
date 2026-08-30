@@ -71,7 +71,21 @@ OUTPUTS_DIR="$REPO_ROOT/outputs"
 mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
 chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
 
-echo "=== games=$GAMES model=$MODEL hours=$HOURS force_grpo=$FORCE_GRPO ==="
+echo "=== RESOLVED SETTINGS ==="
+echo "    games : $GAMES"
+echo "    model : $MODEL"
+echo "    hours : $HOURS"
+echo "    force_grpo=$FORCE_GRPO  gen_chunk=$GEN_CHUNK  step_workers=$STEP_WORKERS"
+# A backslash-continued command line loses its inline assignments if any line
+# has trailing whitespace after the backslash -- the assignments then run as
+# their own statement and the script sees only defaults.  Say so rather than
+# silently training the wrong model.
+if [ "$GAMES" = "goofspiel" ] && [ "$MODEL" = "Qwen/Qwen2.5-3B-Instruct" ]; then
+    echo "    NOTE: both GAMES and MODEL are at their defaults. If you meant to"
+    echo "          override them, check for a space after a trailing backslash,"
+    echo "          or export the variables before calling this script."
+fi
+
 
 cleanup() {
     echo "--- sidecar logs (tail) ---"
@@ -97,7 +111,7 @@ fi
 DATASET_TYPE="{\"environment_names\": [$NAMES_JSON]}"
 echo "    dataset-type: $DATASET_TYPE"
 
-echo "=== 1/4 starting MCTS sidecar ==="
+echo "=== 1/5 starting MCTS sidecar ==="
 docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
 docker pull "$MCTS_IMAGE"
 docker run -d --name "$SIDECAR" --network "$NET" "$MCTS_IMAGE"
@@ -121,11 +135,26 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-echo "=== 2/4 building trainer image from THIS repo ==="
+echo "=== 2/5 building trainer image from THIS repo ==="
 DOCKER_BUILDKIT=1 docker build -t "$TRAINER_IMAGE" \
     -f "$REPO_ROOT/dockerfiles/standalone-text-trainer.dockerfile" "$REPO_ROOT"
 
-echo "=== 3/4 preflight inside the trainer image ==="
+echo "=== 3/5 fetching base model into /cache ==="
+# The trainer counts parameters from the weight files on disk to pick its size
+# bucket, so the model must be in /cache/models BEFORE training -- otherwise it
+# aborts with "Cannot determine model size: weight counting failed".  The
+# official example does this with a separate trainer-downloader image; the
+# trainer image already has huggingface_hub, so we use it directly.
+docker run --rm --network "$NET" \
+    --volume "$CHECKPOINTS_DIR:/cache:rw" \
+    -e HF_TOKEN="$HF_TOKEN" -e HUGGINGFACE_TOKEN="$HF_TOKEN" \
+    -e HF_HUB_ENABLE_HF_TRANSFER=0 \
+    --entrypoint bash "$TRAINER_IMAGE" \
+    -lc "source /workspace/.grpo_env/bin/activate \
+         && cd /workspace/scripts \
+         && python -m tools.fetch_model '$MODEL'"
+
+echo "=== 4/5 preflight inside the trainer image ==="
 # The image installs trl/vllm/etc into a venv, not the system python -- see
 # run_text_trainer.sh, which sources it before doing anything.  Without this
 # activation preflight runs against the base interpreter and reports every
@@ -138,7 +167,7 @@ docker run --rm --gpus all --network "$NET" \
          && cd /workspace/scripts \
          && python -m tools.preflight --probe-env --game $PRIMARY_GAME"
 
-echo "=== 4/4 training ==="
+echo "=== 5/5 training ==="
 docker run --rm --gpus all --network "$NET" \
     --security-opt=no-new-privileges --cap-drop=ALL \
     --memory=64g --cpus=8 \
