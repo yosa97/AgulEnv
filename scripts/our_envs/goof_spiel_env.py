@@ -23,15 +23,40 @@ from our_envs.shared_env import (
 _SELECTED_GAME = "goofspiel"
 _MAX_EPISODE_TOKENS = 16384
 _MAX_PROMPT_LEN = 4225
+_MAX_PLAYOUT_TURNS = 32  # hard stop for the post-training-turn forcing playout
 _TIMEOUT = 2400
 
 # Reward shaping parameters (full-prompt variant)
 _STRATEGY_REWARD_WEIGHT = 0.5
-_STEP_STRATEGY_REWARD   = 0.1
 
 # Reward parameters (last-prompt variant)
 _STRATEGY_REWARD = 1.0
 _INVALID_PENALTY = -0.1
+
+
+def _env_float(name: str, default: float) -> float:
+    """Env-var float that never raises at import time (audit P1 pattern)."""
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# --- Outcome / shaping knobs, env-overridable so they can be A/B-ed ---------
+# Weight on the TERMINAL game result.  The old last-prompt reward scored only
+# "did the bid match the prize card" and multiplied it by prompt/completion
+# length ratio, so the shortest completion won regardless of the game.  The
+# game is now played out with the forcing policy after the training turn, so
+# the terminal reward reflects the bid the model actually chose.
+# 0.0 reproduces the pre-fix behaviour (strategy adherence only).
+_OUTCOME_WEIGHT = max(0.0, min(1.0, _env_float("GOOFSPIEL_OUTCOME_WEIGHT", 0.3)))
+
+# Partial credit for a near-miss bid, scaled by rank distance from the target
+# card.  0.0 = all-or-nothing, which is the pre-fix behaviour.
+_NEAR_MISS_REWARD = max(0.0, _env_float("GOOFSPIEL_NEAR_MISS", 0.0))
+
+# Weight on strategy adherence vs terminal result in the full-prompt variant.
+_STRATEGY_WEIGHT_FULL = max(0.0, min(1.0, _env_float("GOOFSPIEL_STRATEGY_WEIGHT", _STRATEGY_REWARD_WEIGHT)))
 
 REASONING_TAG_PAIRS = [
     ("think", "think"), ("thinking", "thinking"), ("reasoning", "reasoning"),
@@ -83,6 +108,63 @@ def get_hand_cards(observation_text: str, player_id: int = 0) -> list[int]:
     if not m:
         return []
     return [int(c) for c in m.group(1).strip().split()]
+
+
+def target_card_for(prize_card: "int | None", hand_cards: list[int]) -> "int | None":
+    """The card the forcing strategy would play this turn.
+
+    While we still hold the matching card, that is the target: bid == prize is
+    the proven-strong baseline this env distils, and with a full hand the rule
+    below reduces to exactly that.
+
+    Once the matching card has been spent, matching is *impossible* — and the
+    old reward handed out 0.0 for every legal action on those turns, so the
+    whole GRPO group scored identically and the advantage came entirely from
+    the length term.  Fall back to the rank-relative bid the SFT expert uses
+    (``goofspiel_trajectories._bid_weights``): map the prize's strength within
+    the deck onto a rank within our remaining hand.  Unlike "cheapest card that
+    still beats it", this does not burn a high card on a mid-value prize.
+    """
+    if prize_card is None or not hand_cards:
+        return None
+    cards = sorted(hand_cards)
+    if prize_card in cards:
+        return prize_card
+    m = len(cards)
+    if m == 1:
+        return cards[0]
+    deck_size = max(cards[-1], prize_card)
+    prize_frac = (prize_card - 1) / max(deck_size - 1, 1)
+    idx = int(round(prize_frac * (m - 1)))
+    return cards[min(max(idx, 0), m - 1)]
+
+
+def rank_credit(bid_card: "int | None", target: "int | None", hand_cards: list[int]) -> float:
+    """1.0 for the target card, decaying linearly with rank distance in hand."""
+    if bid_card is None or target is None:
+        return 0.0
+    cards = sorted(hand_cards)
+    if len(cards) <= 1 or bid_card not in cards or target not in cards:
+        return 0.0
+    gap = abs(cards.index(bid_card) - cards.index(target))
+    return max(0.0, 1.0 - gap / (len(cards) - 1))
+
+
+def normalize_outcome(env_reward) -> float:
+    """Map the env-server terminal reward onto [-1, 1].
+
+    The other envs in this repo treat the goofspiel/PvP terminal reward as
+    [0, 1] with 0.5 = draw (see liar_dice's ``(r - 0.5) * 2``), so that is the
+    convention assumed here; anything outside [0, 1] is passed through clipped
+    rather than rescaled.  CONFIRM against the env-server you deploy.
+    """
+    try:
+        r = float(env_reward)
+    except (TypeError, ValueError):
+        return 0.0
+    if 0.0 <= r <= 1.0:
+        return (r - 0.5) * 2.0
+    return max(-1.0, min(1.0, r))
 
 
 def remove_reasoning_tags(text: str) -> str:
@@ -193,6 +275,47 @@ def _ensure_initialized(trainer) -> None:
 # They share _ensure_initialized and the outer dispatch boilerplate.
 # ---------------------------------------------------------------------------
 
+def _play_out_with_forcing(
+    env_endpoint: str,
+    episode_id: str,
+    first_action_id: str,
+    observation: str,
+) -> "float | None":
+    """Send ``first_action_id``, then finish the game with the forcing policy.
+
+    Returns the env-server's terminal reward, or ``None`` if the game did not
+    reach a terminal state (transport error, or the turn cap was hit).  No LLM
+    generation happens here — only HTTP — so this costs env round-trips, not
+    the generation semaphore that actually bottlenecks the rollout.
+    """
+    action = first_action_id
+    obs = observation
+    for _ in range(_MAX_PLAYOUT_TURNS):
+        try:
+            step_res = requests.post(
+                f"{env_endpoint}/step",
+                json={"action": action, "episode_id": episode_id},
+                timeout=_TIMEOUT,
+            )
+            step_res.raise_for_status()
+            step_block = step_res.json()["result"]
+        except Exception as exc:
+            print(f"Playout step failed: {exc}")
+            return None
+
+        if step_block.get("done", False):
+            return step_block.get("reward", 0)
+
+        obs = extract_and_format_observation(step_block.get("observation", ""))
+        prize = extract_prize_card(obs)
+        hand = get_hand_cards(obs)
+        target = target_card_for(prize, hand)
+        if target is None:
+            return None
+        action = str(target - 1)
+    return None
+
+
 def _run_episode_last(
     index: int,
     prompt: str,
@@ -221,7 +344,7 @@ def _run_episode_last(
     try:
         reset_res = requests.post(
             f"{env_endpoint}/reset",
-            json={"task_id": game_id, "seed": 42, "opponent": "mcts"},
+            json={"task_id": game_id, "seed": game_id, "opponent": "mcts"},
             timeout=_TIMEOUT,
         )
         reset_res.raise_for_status()
@@ -278,39 +401,55 @@ def _run_episode_last(
 
     messages.append({"role": "assistant", "content": completion_text})
 
-    action_to_send = remove_reasoning_tags(completion_text)
-    if action_to_send.endswith("</s>"):
-        action_to_send = action_to_send[:-5]
+    # removesuffix, not [:-5]: "</s>" is 4 chars, the old slice ate a digit.
+    action_to_send = remove_reasoning_tags(completion_text).removesuffix("</s>").strip()
     if "Action:" in action_to_send:
         action_to_send = action_to_send.split("Action:")[-1].strip()
 
-    bid_card = extract_bid_from_action(action_to_send, formatted_observation)
-    strategy_followed = bid_card is not None and prize_card is not None and bid_card == prize_card
+    hand_cards = get_hand_cards(formatted_observation)
+    bid_card   = extract_bid_from_action(action_to_send, formatted_observation)
+    target     = target_card_for(prize_card, hand_cards)
 
-    invalid_action = False
-    try:
-        action_id_parsed = int(action_to_send.strip())
-        hand_cards = get_hand_cards(formatted_observation)
-        if action_id_parsed not in hand_cards:
-            print(f"Invalid action: {action_id_parsed} not in hand cards: {hand_cards}")
-            print(f"Messages: {messages}")
-            invalid_action = True
-    except Exception:
-        invalid_action = True
-        print(f"Invalid action: {action_to_send}")
+    # Legality is a property of the CARD, not the action id.  The observation
+    # renders "id -> Bid: card" with id = card - 1, so the old check
+    # (`action_id not in hand_cards`) compared an id against card values: it
+    # flagged every bid of card 1 as invalid and mis-scored the rest.
+    invalid_action = bid_card is None or bid_card not in hand_cards
+    if invalid_action:
+        print(f"Invalid action: {action_to_send!r} -> card {bid_card} not in hand {hand_cards}")
+
+    strategy_followed = (not invalid_action) and target is not None and bid_card == target
+
+    # Terminal result of the game this bid actually led to.  Only meaningful
+    # when the bid was legal — an illegal bid never reaches the env.
+    outcome = None
+    if _OUTCOME_WEIGHT > 0.0 and not invalid_action:
+        raw_outcome = _play_out_with_forcing(
+            env_endpoint, episode_id, str(bid_card - 1), formatted_observation
+        )
+        # A failed playout scores as a draw rather than falling back to the
+        # unblended strategy term — otherwise samples inside one GRPO group
+        # would sit on two different reward scales.
+        outcome = normalize_outcome(raw_outcome) if raw_outcome is not None else 0.0
 
     if invalid_action:
         reward = _INVALID_PENALTY
-    elif strategy_followed:
-        len_reward_scale = max(0.2, min(5, len(prompt_ids) / len(completion_ids))) if completion_ids else 0.2
-        reward = _STRATEGY_REWARD * len_reward_scale
     else:
-        reward = 0.0
+        strategy_term = (
+            _STRATEGY_REWARD if strategy_followed
+            else _NEAR_MISS_REWARD * rank_credit(bid_card, target, hand_cards)
+        )
+        if outcome is None:
+            reward = strategy_term
+        else:
+            reward = (1.0 - _OUTCOME_WEIGHT) * strategy_term + _OUTCOME_WEIGHT * outcome
 
     print("--------------------------------")
     print(
-        f"[GT] game={game_id} train_turn={target_turn} "
-        f"strategy={strategy_followed} reward={reward:.3f} hints={use_hints}"
+        f"[GT] game={game_id} train_turn={target_turn} prize={prize_card} "
+        f"bid={bid_card} target={target} strategy={strategy_followed} "
+        f"outcome={'n/a' if outcome is None else f'{outcome:.2f}'} "
+        f"reward={reward:.3f} hints={use_hints}"
     )
     print("--------------------------------")
 
@@ -353,15 +492,13 @@ def _run_episode_full(
     turn_number                = 0
     strategy_followed_count    = 0
     total_strategy_opportunities = 0
-    step_rewards: list[float]  = []
-    all_steps_correct          = True
     use_hints = random.random() < current_hint_prob
 
     # --- Reset environment ---
     try:
         reset_res = requests.post(
             f"{env_endpoint}/reset",
-            json={"task_id": game_id, "seed": 42, "opponent": "mcts"},
+            json={"task_id": game_id, "seed": game_id, "opponent": "mcts"},
             timeout=_TIMEOUT,
         )
         reset_res.raise_for_status()
@@ -423,26 +560,22 @@ def _run_episode_full(
         messages.append({"role": "assistant", "content": completion_text})
 
         # --- Parse action ---
-        action_to_send = completion_text
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-5]
+        # removesuffix, not [:-5]: "</s>" is 4 chars and the old slice ate the
+        # last digit of the action id.  remove_reasoning_tags matches the
+        # last-prompt path, which already stripped <think> blocks.
+        action_to_send = remove_reasoning_tags(completion_text).removesuffix("</s>").strip()
         if "Action:" in action_to_send:
             action_to_send = action_to_send.split("Action:")[-1].strip()
 
         # --- Strategy adherence check ---
+        # No `all_steps_correct` latch: a turn played correctly counts even
+        # after an earlier miss.  The latch zeroed every later correct turn, so
+        # credit assignment collapsed at the first deviation.
         bid_card = extract_bid_from_action(action_to_send, formatted_observation)
-        if bid_card is not None:
-            total_strategy_opportunities += 1
-            if bid_card == prize_card and all_steps_correct:
-                strategy_followed_count += 1
-                step_rewards.append(_STEP_STRATEGY_REWARD)
-            else:
-                all_steps_correct = False
-                step_rewards.append(0.0)
-        else:
-            total_strategy_opportunities += 1
-            all_steps_correct = False
-            step_rewards.append(0.0)
+        target   = target_card_for(prize_card, get_hand_cards(formatted_observation))
+        total_strategy_opportunities += 1
+        if bid_card is not None and target is not None and bid_card == target:
+            strategy_followed_count += 1
 
         # --- Step environment ---
         try:
@@ -478,17 +611,20 @@ def _run_episode_full(
         episode_logprobs       = episode_logprobs[:_MAX_EPISODE_TOKENS]
         episode_action_mask    = episode_action_mask[:_MAX_EPISODE_TOKENS]
 
-    strategy_ratio    = strategy_followed_count / total_strategy_opportunities if total_strategy_opportunities else 0.0
-    immediate_rewards = sum(step_rewards)
+    strategy_ratio = strategy_followed_count / total_strategy_opportunities if total_strategy_opportunities else 0.0
 
-    if not done:
-        shaped_reward = immediate_rewards + strategy_ratio
-    else:
+    # Adherence and outcome now share one scale and sum to at most 1.0 before
+    # penalties.  Previously `immediate_rewards` (0.1 per correct turn, up to
+    # 1.3 over a 13-turn game) was added raw on top of a 0.5-weighted terminal
+    # reward, so playing in-style outweighed winning.
+    if done:
         shaped_reward = (
-            _STRATEGY_REWARD_WEIGHT * strategy_ratio
-            + (1 - _STRATEGY_REWARD_WEIGHT) * train_reward
-            + immediate_rewards
+            _STRATEGY_WEIGHT_FULL * strategy_ratio
+            + (1.0 - _STRATEGY_WEIGHT_FULL) * normalize_outcome(train_reward)
         )
+    else:
+        # No terminal result to score, so adherence only.
+        shaped_reward = _STRATEGY_WEIGHT_FULL * strategy_ratio
     shaped_reward -= 0.05 * float(invalid_count)
 
     print(
@@ -549,7 +685,7 @@ def rollout_first_prompt_and_completion(
         try:
             reset_res = requests.post(
                 f"{env_endpoint}/reset",
-                json={"task_id": game_id, "seed": 42, "opponent": "mcts"},
+                json={"task_id": game_id, "seed": game_id, "opponent": "mcts"},
                 timeout=TIMEOUT,
             )
             reset_res.raise_for_status()
@@ -577,9 +713,7 @@ def rollout_first_prompt_and_completion(
 
             messages.append({"role": "assistant", "content": completion_text})
 
-            action_to_send = completion_text
-            if action_to_send.endswith("</s>"):
-                action_to_send = action_to_send[:-5]
+            action_to_send = remove_reasoning_tags(completion_text).removesuffix("</s>").strip()
             if "Action:" in action_to_send:
                 action_to_send = action_to_send.split("Action:")[-1].strip()
 
