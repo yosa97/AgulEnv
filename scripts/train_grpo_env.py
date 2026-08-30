@@ -46,7 +46,10 @@ from our_envs.env_configs import EnvTrainingConfig, SizeHyperparams, get_env_con
 # Fallback training dynamics per model size. ModeConfig.per_size overrides per (env, mode, size).
 DEFAULT_HYPERPARAMS: dict[str, SizeHyperparams] = {
     "0_1_b":  SizeHyperparams(per_device_train_batch_size=4,  gradient_accumulation_steps=6,  num_generations=4, vllm_gpu_memory_utilization=0.4,  beta=0.02),
-    "1_2_b":  SizeHyperparams(per_device_train_batch_size=3,  gradient_accumulation_steps=12, num_generations=4, vllm_gpu_memory_utilization=0.4,  beta=0.04),
+    # accum 12 -> 16: with num_generations=8 (liars_dice / leduc_poker) the old
+    # generation_batch_size 3*1*12=36 is not divisible by 8 and trips the guard
+    # in resolve_grpo_dependent_args.  3*1*16=48 works for both 4 and 8.
+    "1_2_b":  SizeHyperparams(per_device_train_batch_size=3,  gradient_accumulation_steps=16, num_generations=4, vllm_gpu_memory_utilization=0.4,  beta=0.04),
     "2_4_b":  SizeHyperparams(per_device_train_batch_size=2,  gradient_accumulation_steps=8,  num_generations=4, vllm_gpu_memory_utilization=0.3,  beta=0.01),
     "4_5_b":  SizeHyperparams(per_device_train_batch_size=2,  gradient_accumulation_steps=8,  num_generations=4, vllm_gpu_memory_utilization=0.35, beta=0.01),
     "5_6_b":  SizeHyperparams(per_device_train_batch_size=2,  gradient_accumulation_steps=8,  num_generations=4, vllm_gpu_memory_utilization=0.35, beta=0.01),
@@ -815,12 +818,24 @@ def main():
         hp = mode_cfg.per_size.get(size_label)
         if hp is None:
             hp = DEFAULT_HYPERPARAMS[size_label]
-            if mode_cfg.num_generations is not None:
-                hp = replace(hp, num_generations=mode_cfg.num_generations)
+            # Mode-level override wins; otherwise honour the env-level value
+            # (liars_dice / leduc_poker set num_generations=8 there).
+            num_gen = (
+                mode_cfg.num_generations
+                if mode_cfg.num_generations is not None
+                else cfg.num_generations
+            )
+            if num_gen is not None:
+                hp = replace(hp, num_generations=num_gen)
         hp.apply(training_args)
         mode_cfg.apply_scalars(training_args)
         resolve_grpo_dependent_args(training_args)
         training_args.num_iterations = cfg.num_iterations
+        # Env-level sampling params were previously defined in the registry
+        # but never reached training_args.
+        training_args.temperature = cfg.temperature
+        if cfg.top_k:
+            training_args.top_k = cfg.top_k
         training_args.vllm_max_model_length = cfg.vllm_max_model_length + (2048 if is_reasoning else 0)
         training_args.max_completion_length = mode_cfg.max_completion_length or default_completion_length
         trainer_class = mode_cfg.trainer_class or default_trainer_class

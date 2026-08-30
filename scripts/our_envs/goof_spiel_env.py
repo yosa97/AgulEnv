@@ -493,7 +493,7 @@ def _run_episode_full(
 
     print(
         "[ID:{:<6} Done:{} T:{:>2d} | EnvR:{:>6.2f} | TrainR:{:>6.2f} | Inv:{:<2}]".format(
-            str(game_id)[:6], int(done), turn_number, final_reward, episode_reward, invalid_count,
+            str(game_id)[:6], int(done), turn_number, train_reward, shaped_reward, invalid_count,
         )
     )
 

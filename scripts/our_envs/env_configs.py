@@ -104,6 +104,25 @@ class ModeConfig:
     # None → mode default (2048 for reasoning, 16 for no_mask/full_prompt)
     max_completion_length: int | None = None
 
+    # None → fall back to the env-level ``EnvTrainingConfig.num_generations``.
+    num_generations: int | None = None
+
+    # Fully-specified hyperparams for one (env, mode, size).  A size_label
+    # present here wins over ``DEFAULT_HYPERPARAMS`` in train_grpo_env.py.
+    # Annotated as a string: SizeHyperparams is defined further down.
+    per_size: "dict[str, SizeHyperparams]" = field(default_factory=dict)
+
+    def apply_scalars(self, args) -> None:
+        """Apply the scalar overrides that are not part of SizeHyperparams.
+
+        Called by train_grpo_env.py *after* ``SizeHyperparams.apply``, so these
+        win over both the CLI defaults and the per-size table.
+        """
+        if self.initial_max_turn is not None:
+            args.initial_max_turn = self.initial_max_turn
+        if self.rollouts_per_stage is not None:
+            args.rollouts_per_stage = self.rollouts_per_stage
+
 
 # ---------------------------------------------------------------------------
 # SizeHyperparams — co-tuned VRAM/dynamics params for one (env, mode, size)
@@ -147,6 +166,9 @@ class EnvTrainingConfig:
     temperature:     float = 1.0
     top_k:           int   = 0
 
+    # GRPO inner-loop iterations (mu).  Applied in train_grpo_env.py.
+    num_iterations:  int   = 2
+
     # Per-mode overrides.  Omit or leave fields as None to use mode defaults.
     reasoning:  ModeConfig = field(default_factory=ModeConfig)
     no_mask:    ModeConfig = field(default_factory=ModeConfig)
@@ -158,7 +180,8 @@ class EnvTrainingConfig:
 # ---------------------------------------------------------------------------
 
 _REGISTRY: dict[str, EnvTrainingConfig] = {
-    "goof_spiel": EnvTrainingConfig(
+    # Key must match GAMES_TO_TASK_ID_RANGE in shared_env.py exactly.
+    "goofspiel": EnvTrainingConfig(
         rollout_full=_goof_rollout_full,
         rollout_last=_goof_rollout_last,
         reward_func=_goof_reward,

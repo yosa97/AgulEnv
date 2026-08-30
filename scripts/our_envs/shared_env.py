@@ -19,6 +19,10 @@ GAMES_TO_TASK_ID_RANGE: dict[str, tuple[int, int]] = {
     "backgammon":  (500000000, 599_999_999),
     "hex":         (600000000, 699_999_999),
     "clobber":     (700000000, 799_999_999),
+    # AlfWorld game ids index directly into the AgentGym alfworld game set
+    # (passed through as {"game": game_id} in alf_world_env.py).  Confirm the
+    # upper bound against the deployed server before a real run.
+    "alfworld":    (0,         3554),
 }
 
 
