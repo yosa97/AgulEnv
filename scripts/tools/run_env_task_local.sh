@@ -165,7 +165,7 @@ docker run --rm --gpus all --network "$NET" \
     --entrypoint bash "$TRAINER_IMAGE" \
     -lc "source /workspace/.grpo_env/bin/activate \
          && cd /workspace/scripts \
-         && python -m tools.preflight --probe-env --game $PRIMARY_GAME"
+         && python -m tools.preflight --probe-env --game '$GAMES'"
 
 echo "=== 5/5 training ==="
 docker run --rm --gpus all --network "$NET" \

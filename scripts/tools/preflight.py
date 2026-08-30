@@ -19,6 +19,14 @@ import sys
 # (G.O.D core/constants/environments.py).
 PVP_GAMES = ["gin_rummy", "liars_dice", "leduc_poker", "othello", "clobber", "goofspiel"]
 
+# The other two environments a task can name.  Neither is served by the MCTS
+# sidecar: intercode generates offline against filesystem snapshots baked into
+# the trainer image, and swe_infinite passes a mounted dataset through.  They
+# have no task-id range and no /reset -- probing them as PvP games is a
+# category error, not a failure.
+NON_PVP_ENVS = ["intercode", "swe_infinite"]
+ALL_ENVS = PVP_GAMES + NON_PVP_ENVS
+
 # How each game turns a raw sidecar observation into the prompt body the model
 # sees.  This matters for the probe: several games do not receive a rendered
 # "<id> -> <label>" block at all -- goofspiel SYNTHESISES one from "P0 hand:",
@@ -141,8 +149,50 @@ def check_registry() -> None:
         check(f"{game:12s} registry entry", resolved, detail)
 
 
+def probe_offline_env(game: str) -> None:
+    """Checks that make sense for an env with no sidecar."""
+    if game == "intercode":
+        # Generation restores one of these snapshots per task; without them
+        # intercode_synth_gen produces nothing and the env silently
+        # contributes zero rows to the merge.
+        import os.path
+
+        for fs in (1, 2, 4):
+            tar = f"/intercode_fs/fs{fs}.tar"
+            exists = os.path.isfile(tar)
+            size = os.path.getsize(tar) / 1024**2 if exists else 0
+            check(
+                f"intercode snapshot fs{fs}.tar",
+                exists,
+                f"{size:.1f} MB" if exists else "missing -- baked by the image build",
+            )
+        try:
+            from our_envs.intercode_local_bash_env import LocalBashEnv  # noqa: F401
+            from our_envs.intercode_synth_gen import main as _m  # noqa: F401
+            check("intercode generator imports", True)
+        except Exception as exc:
+            check("intercode generator imports", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    if game == "swe_infinite":
+        try:
+            from our_envs.swe_trajectories import main as _m  # noqa: F401
+            check("swe_infinite generator imports", True, "dataset is mounted at task time")
+        except Exception as exc:
+            check("swe_infinite generator imports", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    check(f"{game} offline probe", False, "unknown non-PvP env")
+
+
 def probe_env(game: str) -> None:
     """One reset + one step against a live sidecar."""
+    if game in NON_PVP_ENVS:
+        probe_offline_env(game)
+        return
+    if game not in PVP_GAMES:
+        check(f"{game} probe", False, "not a known environment name")
+        return
     try:
         import requests
 
@@ -281,7 +331,8 @@ def _check_reward_inputs(game: str, body: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe-env", action="store_true", help="hit the live env sidecar")
-    ap.add_argument("--game", default=None, help="probe only this game")
+    ap.add_argument("--game", default=None,
+                    help="probe only these envs (comma-separated)")
     ap.add_argument("--obs-lines", type=int, default=40, help="observation lines to print")
     args = ap.parse_args()
 
@@ -297,7 +348,11 @@ def main() -> int:
     check_registry()
 
     if args.probe_env:
-        for game in [args.game] if args.game else PVP_GAMES:
+        selected = (
+            [g.strip() for g in args.game.split(",") if g.strip()]
+            if args.game else ALL_ENVS
+        )
+        for game in selected:
             section(f"Live probe: {game}")
             probe_env(game)
 
