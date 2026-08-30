@@ -35,6 +35,14 @@ def section(title: str) -> None:
 
 def check_versions() -> None:
     section("Runtime")
+    print(f"        python: {sys.executable}")
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    check(
+        "running inside the trainer venv",
+        in_venv,
+        "packages live in /workspace/.grpo_env -- "
+        "source /workspace/.grpo_env/bin/activate first",
+    )
     try:
         import torch
 
@@ -103,9 +111,14 @@ def check_registry() -> None:
 
 def probe_env(game: str) -> None:
     """One reset + one step against a live sidecar."""
-    import requests
+    try:
+        import requests
 
-    from our_envs.shared_env import GAMES_TO_TASK_ID_RANGE
+        from our_envs.batched_rollout import legal_ids_from_observation
+        from our_envs.shared_env import GAMES_TO_TASK_ID_RANGE
+    except Exception as exc:
+        check(f"{game} imports", False, f"{type(exc).__name__}: {exc}")
+        return
 
     urls = [u.strip() for u in os.environ.get("ENVIRONMENT_SERVER_URLS", "").split(",") if u.strip()]
     if not urls:
@@ -135,8 +148,6 @@ def probe_env(game: str) -> None:
     print("        --- observation ---")
     for line in obs.splitlines()[:14]:
         print(f"        {line}")
-
-    from our_envs.batched_rollout import legal_ids_from_observation
 
     legal = legal_ids_from_observation(obs)
     check(

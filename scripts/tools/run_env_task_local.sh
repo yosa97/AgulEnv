@@ -94,11 +94,17 @@ DOCKER_BUILDKIT=1 docker build -t "$TRAINER_IMAGE" \
     -f "$REPO_ROOT/dockerfiles/standalone-text-trainer.dockerfile" "$REPO_ROOT"
 
 echo "=== 3/4 preflight inside the trainer image ==="
-docker run --rm --network "$NET" \
+# The image installs trl/vllm/etc into a venv, not the system python -- see
+# run_text_trainer.sh, which sources it before doing anything.  Without this
+# activation preflight runs against the base interpreter and reports every
+# package missing.  --gpus all so the CUDA check is meaningful.
+docker run --rm --gpus all --network "$NET" \
     -e ENVIRONMENT_SERVER_URLS="$ENV_URL" \
     -e GEN_CHUNK="$GEN_CHUNK" -e STEP_WORKERS="$STEP_WORKERS" \
     --entrypoint bash "$TRAINER_IMAGE" \
-    -lc "cd /workspace/scripts && python -m tools.preflight --probe-env --game $GAME"
+    -lc "source /workspace/.grpo_env/bin/activate \
+         && cd /workspace/scripts \
+         && python -m tools.preflight --probe-env --game $GAME"
 
 echo "=== 4/4 training ==="
 docker run --rm --gpus all --network "$NET" \
