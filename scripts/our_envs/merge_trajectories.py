@@ -219,6 +219,26 @@ def _resolve_target(path: str, per_env_map: dict, default: int) -> int:
     return default
 
 
+def _ensure_tools_col(ds: "Dataset") -> "Dataset":
+    """Give every part a ``tools`` column so parts from different envs concatenate.
+
+    Generators that emit tool-call rows attach a per-row ``tools`` JSON string
+    (train_sft_env json.loads it before apply_chat_template).  A generator that
+    does not would produce a part whose Arrow features disagree, and
+    ``concatenate_datasets`` refuses the whole merge rather than just that part
+    -- one env without the column would take the entire task down.  An empty
+    string means "no tools block", which is what ``example.get("tools") or None``
+    already treats as absent.
+    """
+    try:
+        if len(ds) == 0 or "tools" in ds.column_names:
+            return ds
+        return ds.add_column("tools", [""] * len(ds))
+    except Exception as exc:
+        print(f"[merge_trajectories] could not normalise tools column: {exc}", flush=True)
+        return ds
+
+
 def _balance_split(ds: "Dataset", target: int, max_upsample: float, seed: int,
                    label: str) -> "Dataset":
     """Level one env's train split toward `target` examples.
@@ -390,13 +410,14 @@ def main() -> None:
     if _flag_on("QGAP_WEIGHTING"):
         _beta = _float_env("QGAP_BETA", 1.0)
         _forced_keep = _float_env("QGAP_FORCED_KEEP", 0.10)
-        train_parts = [_ensure_meta_cols(p) for p in train_parts]
+        train_parts = [_ensure_tools_col(_ensure_meta_cols(p)) for p in train_parts]
         merged_train = concatenate_datasets(train_parts).shuffle(seed=args.shuffle_seed)
         merged_train = _apply_qgap_weighting(merged_train, _beta, _forced_keep,
                                              args.shuffle_seed)
     else:
-        train_parts = [_strip_meta_cols(p) for p in train_parts]
+        train_parts = [_ensure_tools_col(_strip_meta_cols(p)) for p in train_parts]
         merged_train = concatenate_datasets(train_parts).shuffle(seed=args.shuffle_seed)
+    val_parts = [_ensure_tools_col(p) for p in val_parts]
     merged_val = (
         concatenate_datasets(val_parts).shuffle(seed=args.shuffle_seed)
         if val_parts else None

@@ -15,19 +15,34 @@
 #      hand its URL to the trainer via ENVIRONMENT_SERVER_URLS.
 #
 # Usage:
-#   GAME=goofspiel MODEL=Qwen/Qwen2.5-3B-Instruct HOURS=1.0 \
+#   GAMES=goofspiel,intercode MODEL=unsloth/Meta-Llama-3.1-8B-Instruct HOURS=1.5 \
 #   HF_TOKEN=hf_xxx HF_USER=yourname \
 #   bash scripts/tools/run_env_task_local.sh
 #
-# Games: gin_rummy liars_dice leduc_poker othello clobber goofspiel
+# Games: gin_rummy liars_dice leduc_poker othello clobber goofspiel intercode
+#
+# IMPORTANT -- which code path this exercises.  text_trainer.py dispatches on
+# the environment_names LIST:
+#
+#     env_names = dataset_type_dict.get("environment_names", [])
+#     if env_names and all(supports_sft(n) for n in env_names):  -> SFT pipeline
+#     else:                                                       -> GRPO pipeline
+#
+# All six PvP games sit in sft_env_configs._SFT_REGISTRY, and intercode /
+# swe_infinite sit in _SFT_NON_ROLLOUT_ENVS, so ANY real task list takes the
+# SFT pipeline (generate trajectories -> merge -> train_sft_env).  The GRPO
+# pipeline only runs for a name in NEITHER set, e.g. alfworld.  Set FORCE_GRPO=1
+# to append such a name and exercise the GRPO path instead.
 set -euo pipefail
 
-GAME="${GAME:-goofspiel}"
+GAMES="${GAMES:-${GAME:-goofspiel}}"          # comma-separated; GAME still works
 MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct}"
 HOURS="${HOURS:-1.0}"
+FORCE_GRPO="${FORCE_GRPO:-0}"
 # Numeric, matching the official example -- it becomes a checkpoint dir name.
 TASK_ID="${TASK_ID:-1}"
-REPO_NAME="${REPO_NAME:-env-smoke-$GAME}"
+PRIMARY_GAME="${GAMES%%,*}"
+REPO_NAME="${REPO_NAME:-env-smoke-$PRIMARY_GAME}"
 HF_TOKEN="${HF_TOKEN:-}"
 HF_USER="${HF_USER:-}"
 WANDB_TOKEN="${WANDB_TOKEN:-}"
@@ -40,11 +55,13 @@ STEP_WORKERS="${STEP_WORKERS:-16}"
 
 # The trainer wants a dataset argument even for EnvTask; game data comes from
 # the sidecar, so any small reachable file satisfies the downloader.
-DATASET="${DATASET:-https://huggingface.co/datasets/TuringEnterprises/Turing-Open-Reasoning/resolve/main/Computational_STEM_QA_Dataset.json?download=true}"
+# Real EnvTask records carry the literal string "env_task_dummy_dataset" as
+# training_data -- game data comes from the sidecar, not from a file.
+DATASET="${DATASET:-env_task_dummy_dataset}"
 FILE_FORMAT="${FILE_FORMAT:-s3}"
 
 NET="${NET:-god-local}"
-SIDECAR="${SIDECAR:-mcts-api-$GAME}"
+SIDECAR="${SIDECAR:-mcts-api-$PRIMARY_GAME}"
 MCTS_IMAGE="${MCTS_IMAGE:-gradientsio/mcts-api:latest}"
 TRAINER_IMAGE="${TRAINER_IMAGE:-agulenv-trainer}"
 
@@ -54,7 +71,7 @@ OUTPUTS_DIR="$REPO_ROOT/outputs"
 mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
 chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
 
-echo "=== game=$GAME model=$MODEL hours=$HOURS ==="
+echo "=== games=$GAMES model=$MODEL hours=$HOURS force_grpo=$FORCE_GRPO ==="
 
 cleanup() {
     echo "--- sidecar logs (tail) ---"
@@ -64,6 +81,21 @@ cleanup() {
 trap cleanup EXIT
 
 docker network create "$NET" >/dev/null 2>&1 || true
+
+# Build the environment_names JSON list the trainer actually reads.
+NAMES_JSON=""
+IFS=',' read -ra _GAME_ARR <<< "$GAMES"
+for g in "${_GAME_ARR[@]}"; do
+    g="$(echo "$g" | xargs)"
+    [ -z "$g" ] && continue
+    NAMES_JSON="${NAMES_JSON:+$NAMES_JSON, }\"$g\""
+done
+if [ "$FORCE_GRPO" = "1" ]; then
+    NAMES_JSON="$NAMES_JSON, \"alfworld\""
+    echo "    FORCE_GRPO=1 -> appending alfworld so dispatch falls to the GRPO path"
+fi
+DATASET_TYPE="{\"environment_names\": [$NAMES_JSON]}"
+echo "    dataset-type: $DATASET_TYPE"
 
 echo "=== 1/4 starting MCTS sidecar ==="
 docker rm -f "$SIDECAR" >/dev/null 2>&1 || true
@@ -104,7 +136,7 @@ docker run --rm --gpus all --network "$NET" \
     --entrypoint bash "$TRAINER_IMAGE" \
     -lc "source /workspace/.grpo_env/bin/activate \
          && cd /workspace/scripts \
-         && python -m tools.preflight --probe-env --game $GAME"
+         && python -m tools.preflight --probe-env --game $PRIMARY_GAME"
 
 echo "=== 4/4 training ==="
 docker run --rm --gpus all --network "$NET" \
@@ -116,12 +148,12 @@ docker run --rm --gpus all --network "$NET" \
     -e GEN_CHUNK="$GEN_CHUNK" -e STEP_WORKERS="$STEP_WORKERS" \
     -e HUGGINGFACE_TOKEN="$HF_TOKEN" -e HUGGINGFACE_USERNAME="$HF_USER" \
     -e WANDB_TOKEN="$WANDB_TOKEN" \
-    --name "grpo-env-$GAME" \
+    --name "env-task-$PRIMARY_GAME" \
     "$TRAINER_IMAGE" \
     --task-id "$TASK_ID" \
     --model "$MODEL" \
     --dataset "$DATASET" \
-    --dataset-type "{\"environment_name\": \"$GAME\"}" \
+    --dataset-type "$DATASET_TYPE" \
     --task-type "EnvTask" \
     --file-format "$FILE_FORMAT" \
     --hours-to-complete "$HOURS" \

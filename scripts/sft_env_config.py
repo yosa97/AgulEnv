@@ -7,6 +7,22 @@ No GRPO content; no vLLM/num_generations/beta.
 import os
 from copy import deepcopy
 
+
+def _env_int(name: str, default: int) -> int:
+    """Env-var int that never raises at import time."""
+    try:
+        return int(float(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _log(*args, **kwargs):
     """Flush-by-default print for the SFT orchestrator. Each concurrent per-env gen
     process buffers its stdout independently, so flush keeps the interleaved logs live."""
@@ -303,10 +319,22 @@ def get_training_json(train_info: dict) -> dict:
             )
     # Parallel: each env's gen runs as a backgrounded subshell; `wait` blocks for all; merge after.
     _parallel = " & ".join(f"({s})" for s in _steps) + " & wait"
+    # Per-env balancing. merge_trajectories implements it, but the command built
+    # here never passed --target_per_env, so _balance_split returned immediately
+    # and the merge was a plain concatenation. On a joint task that is not
+    # neutral: goofspiel generates 6000 games through a sliding window while
+    # intercode is capped at --max_per_fs 600 per filesystem, so the scored
+    # intercode half of the task was outnumbered by more than an order of
+    # magnitude. --max_upsample still guards a low-unique env from being
+    # repeated into overfit.
+    _target = _env_int("SFT_TARGET_PER_ENV", 20000)
+    _max_up = _env_float("SFT_MAX_UPSAMPLE", 3.0)
     _merge = (
         f"python -m our_envs.merge_trajectories"
         f" --input_paths {' '.join(_per_env_paths)}"
         f" --output_path {dataset_path}"
+        f" --target_per_env {_target}"
+        f" --max_upsample {_max_up}"
     )
     generate_cmd = f"{_parallel} && {_merge}"
 

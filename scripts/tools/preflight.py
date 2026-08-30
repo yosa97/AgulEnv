@@ -184,6 +184,9 @@ def probe_env(game: str) -> None:
     if len(obs.splitlines()) > _MAX_OBS_LINES:
         print(f"        ... ({len(obs.splitlines()) - _MAX_OBS_LINES} more)")
 
+    raw_legal = legal_ids_from_observation(obs)
+    print(f"        legal ids in RAW: {raw_legal[:10] if raw_legal else 'none (may be synthesised by the transform)'}")
+
     transform = load_obs_transform(game)
     if transform is None:
         check(f"{game} obs_transform known", False, "no entry in OBS_TRANSFORMS")
@@ -209,12 +212,21 @@ def probe_env(game: str) -> None:
     if len(body.splitlines()) > _MAX_OBS_LINES:
         print(f"        ... ({len(body.splitlines()) - _MAX_OBS_LINES} more)")
 
+    check(
+        f"{game} transformed body has a Legal Actions block",
+        "Legal Actions" in body,
+        "the rollout shows this body to the model; without the block the model "
+        "is never told which ids are legal",
+    )
+
     legal = legal_ids_from_observation(body)
     check(
         f"{game} legal ids parse after transform",
         bool(legal),
         f"{legal[:10]}{'...' if len(legal) > 10 else ''}" if legal else "none found",
     )
+
+    _check_reward_inputs(game, body)
 
     if legal:
         try:
@@ -232,6 +244,38 @@ def probe_env(game: str) -> None:
             )
         except Exception as exc:
             check(f"{game} step", False, str(exc))
+
+
+def _check_reward_inputs(game: str, body: str) -> None:
+    """Exercise the fields the reward code actually reads.
+
+    A transform can "run" and still hand back text the scorer cannot parse.  For
+    goofspiel the reward path needs the prize card and our hand on every turn --
+    if either comes back None the forcing policy and the strategy term silently
+    do nothing, which looks like a flat reward rather than an error.
+    """
+    if game != "goofspiel":
+        return
+    try:
+        from our_envs.goof_spiel_env import (
+            extract_prize_card,
+            get_hand_cards,
+            target_card_for,
+        )
+    except Exception as exc:
+        check("goofspiel reward helpers import", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    prize = extract_prize_card(body)
+    hand = get_hand_cards(body)
+    check("goofspiel prize card parses", prize is not None, f"prize={prize}")
+    check("goofspiel hand parses", bool(hand), f"hand={hand}")
+    target = target_card_for(prize, hand)
+    check(
+        "goofspiel forcing target resolves",
+        target is not None,
+        f"target card={target} -> action id={None if target is None else target - 1}",
+    )
 
 
 def main() -> int:

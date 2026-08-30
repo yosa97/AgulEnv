@@ -27,6 +27,11 @@ from concurrent.futures.process import BrokenProcessPool
 
 from datasets import Dataset, DatasetDict
 
+from our_envs.pvp_tool_calling import (
+    legal_ids_from_user,
+    pvp_tools_json,
+    tool_calling_enabled,
+)
 from our_envs.shared_env import GAMES_TO_TASK_ID_RANGE, init_env_pool
 from our_envs.sft_env_configs import get_sft_trajectory_generator, inprocess_kind, runs_inprocess
 
@@ -248,6 +253,34 @@ def _maybe_prebuild_ld_blueprint(env_name: str, num_workers: int) -> None:
             print(f"[generate_trajectories] LD prebuild wrote {len(bp)} infosets -> {path}", flush=True)
     except Exception as exc:
         print(f"[generate_trajectories] LD prebuild skipped (non-fatal): {type(exc).__name__}: {exc}", flush=True)
+
+
+
+def _tools_for_window(conv: list) -> str:
+    """The ``tools`` JSON string for one windowed conversation.
+
+    Empty string when the run is on the legacy bare_id surface (no tool block is
+    rendered there) or when the window has no parseable legal-action list, so
+    the column stays a uniform string type across envs.
+    """
+    if not tool_calling_enabled():
+        return ""
+    user = next(
+        (m.get("content", "") for m in reversed(conv) if m.get("role") == "user"), ""
+    )
+    try:
+        ids = legal_ids_from_user(user)
+    except Exception:
+        return ""
+    if not ids:
+        # No parseable legal-action list: emitting a game_action schema with an
+        # empty enum would not match what the validator renders for that turn,
+        # so leave the block off rather than train on a different shape.
+        return ""
+    try:
+        return pvp_tools_json(ids)
+    except Exception:
+        return ""
 
 
 def main() -> None:
@@ -664,7 +697,16 @@ def main() -> None:
     print(f"[generate_trajectories] windows total={len(conversations)}", flush=True)
     print(f"[generate_trajectories] stats={_stats(conversations)}", flush=True)
 
-    dataset = Dataset.from_list([{"messages": c} for c in conversations])
+    # Per-row `tools` column.  pvp_tools_json / legal_ids_from_user existed but
+    # had no caller, so every generated row reached train_sft_env with
+    # example.get("tools") == None and apply_chat_template rendered the turn
+    # WITHOUT the <tools> block the validator shows at eval -- a train/eval
+    # prefix mismatch at exactly the point pvp_tool_calling's own module
+    # docstring calls the root of the forfeit bug class.  Computed here, per
+    # window, because windowing is what decides which user turn a row carries.
+    dataset = Dataset.from_list(
+        [{"messages": c, "tools": _tools_for_window(c)} for c in conversations]
+    )
     splits = dataset.train_test_split(test_size=VALIDATION_RATIO, seed=args.seed)
     dd = DatasetDict({"train": splits["train"], "validation": splits["test"]})
 

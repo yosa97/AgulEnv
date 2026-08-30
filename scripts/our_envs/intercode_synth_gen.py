@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import re
@@ -38,10 +39,16 @@ from pathlib import Path
 from datasets import Dataset, DatasetDict
 
 from our_envs.intercode_local_bash_env import LocalBashEnv, is_safe_for_real_exec
-from our_envs.intercode_tool_format import build_tool_examples_multiturn
+from our_envs.intercode_tool_format import INTERCODE_TOOLS, build_tool_examples_multiturn
 
 
 VALIDATION_RATIO = 0.01
+
+# Per-row `tools` column, as a JSON string. train_sft_env json.loads it and
+# passes it to apply_chat_template, so the training prefix carries the same
+# <tools> block the eval harness renders. Constant here: intercode offers
+# execute_bash and submit on every turn.
+_INTERCODE_TOOLS_JSON = json.dumps(INTERCODE_TOOLS)
 
 # fs we can generate on: 1=/testbed, 2=/system (real files); 4=string/stdin (no
 # fs). fs3=/workspace is excluded — it manages the trainer's own working dir.
@@ -736,9 +743,32 @@ def main() -> None:
         if not examples:
             return
         try:
-            ds = Dataset.from_list(examples)
-            splits = ds.train_test_split(test_size=VALIDATION_RATIO, seed=args.seed)
-            dd = DatasetDict({"train": splits["train"], "validation": splits["test"]})
+            # Split by TASK, not by row. build_tool_examples_multiturn returns
+            # [ex1, ex2, ex2] -- the duplicate is a deliberate 1:2 upweight of the
+            # submit-after-observation turn -- so a row-level train_test_split can
+            # put the SAME example in both train and validation, and the val loss
+            # stops measuring generalisation. Grouping by source task keeps the
+            # intended upweight inside whichever split the task lands in.
+            groups = sorted({e["_group"] for e in examples})
+            rng = random.Random(args.seed)
+            rng.shuffle(groups)
+            n_val = int(round(len(groups) * VALIDATION_RATIO)) if len(groups) > 1 else 0
+            val_groups = set(groups[:n_val])
+
+            def _row(e: dict) -> dict:
+                return {"messages": e["messages"], "tools": e["tools"]}
+
+            train_rows = [_row(e) for e in examples if e["_group"] not in val_groups]
+            val_rows = [_row(e) for e in examples if e["_group"] in val_groups]
+            dd = DatasetDict({
+                "train": Dataset.from_list(train_rows),
+                # Keep the column schema even when there is no validation split,
+                # so the merge step still sees matching features.
+                "validation": (
+                    Dataset.from_list(val_rows) if val_rows
+                    else Dataset.from_dict({"messages": [], "tools": []})
+                ),
+            })
             dd.save_to_disk(args.output_path)
             print(
                 f"[intercode_synth] {label} save: {len(examples)} examples -> {args.output_path} "
@@ -820,7 +850,10 @@ def main() -> None:
                 tool_exs = None
             if not tool_exs:
                 continue
-            examples.extend({"messages": m} for m in tool_exs)
+            examples.extend(
+                {"messages": m, "tools": _INTERCODE_TOOLS_JSON, "_group": built}
+                for m in tool_exs
+            )
             built += 1
             produced += 1
             if len(examples) and len(examples) % 2000 < len(tool_exs):
