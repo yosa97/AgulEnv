@@ -732,6 +732,8 @@ def main() -> None:
     snapshot_root = Path(args.snapshot_root)
     rng = random.Random(args.seed)
     walltime_budget = float(os.environ.get("INTERCODE_GEN_WALLTIME_SEC", "2700"))
+    # Consecutive duplicate draws that mean the template x inventory space is spent.
+    _EXHAUST_STREAK = int(os.environ.get("INTERCODE_EXHAUST_STREAK", "3000"))
     start_ts = time.monotonic()
 
     examples: list[dict] = []
@@ -806,6 +808,13 @@ def main() -> None:
         seen: set[tuple] = set()
         dirty = False
         produced = 0
+        # Consecutive draws that collided with an already-generated (query, gold).
+        # The real ceiling on intercode diversity is templates x filesystem
+        # inventory, not the attempt count: once every combination has been
+        # drawn, further attempts only burn wall time. Stop and SAY the ceiling,
+        # so the cap can be set from evidence instead of guessed.
+        stale = 0
+        attempts = 0
         for i in range(args.per_fs):
             if i and i % 500 == 0:
                 elapsed = time.monotonic() - start_ts
@@ -816,6 +825,7 @@ def main() -> None:
                 )
             if time.monotonic() - start_ts > walltime_budget:
                 break
+            attempts += 1
             t = rng.choice(templates)
             try:
                 out = t.fn(inv, rng)
@@ -826,8 +836,18 @@ def main() -> None:
             query, gold = out
             key = (query, gold)
             if key in seen:
+                stale += 1
+                if stale >= _EXHAUST_STREAK:
+                    print(
+                        f"[intercode_synth] fs{fs_v}: diversity exhausted at {produced} unique "
+                        f"tasks after {attempts} attempts ({stale} consecutive duplicates) -- "
+                        f"raising --max_per_fs further will not help this fs",
+                        flush=True,
+                    )
+                    break
                 continue
             seen.add(key)
+            stale = 0
             if not is_safe_for_real_exec(gold):
                 dropped_unsafe += 1
                 continue
@@ -860,9 +880,12 @@ def main() -> None:
                 _save(f"checkpoint@{len(examples)}")
             if args.max_per_fs and produced >= args.max_per_fs:
                 break
+        _yield = (100.0 * produced / attempts) if attempts else 0.0
         print(
-            f"[intercode_synth] fs{fs_v}: produced {produced} grounded tasks "
-            f"({len(_FS_ROOTS.get(fs_v, '')) and len(inv.files)} source files).",
+            f"[intercode_synth] fs{fs_v}: produced {produced} grounded tasks from {attempts} "
+            f"attempts (yield {_yield:.0f}%, {len(templates)} templates, "
+            f"{len(_FS_ROOTS.get(fs_v, '')) and len(inv.files)} source files)"
+            f"{' -- CAP HIT, more available' if args.max_per_fs and produced >= args.max_per_fs else ''}.",
             flush=True,
         )
 

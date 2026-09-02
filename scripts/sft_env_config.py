@@ -298,9 +298,26 @@ def get_training_json(train_info: dict) -> dict:
         _out = f"{dataset_path}_{_env}"
         _per_env_paths.append(_out)
         if _env == "intercode":
+            # Diversity caps, raised and made overridable.
+            #
+            # The old --max_per_fs 600 stopped each filesystem at 600 grounded
+            # tasks: 1800 total, ~5.3k examples. With the merge balancing above
+            # that meant intercode was UPSAMPLED ~3x -- the same 1800 tasks
+            # repeated -- to reach its share of the dataset. Repetition is not
+            # data. fs2 alone exposes 30 source files to its templates, so the
+            # combination space is several times larger than the cap allowed,
+            # and the generator finished the whole run in ~25s against a 2700s
+            # walltime budget. The cap was the binding constraint, not time or
+            # diversity. Raising it trades repeated rows for unique ones at
+            # roughly the same dataset size. intercode_synth_gen now stops on
+            # its own when the template x inventory space is genuinely spent,
+            # and logs the ceiling it reached, so these numbers can be tuned
+            # from evidence next round.
+            _ic_per_fs = _env_int("INTERCODE_PER_FS", 30000)
+            _ic_max_per_fs = _env_int("INTERCODE_MAX_PER_FS", 2500)
             _steps.append(
                 f"python -m our_envs.intercode_synth_gen --output_path {_out}"
-                f" --per_fs 4000 --max_per_fs 600"
+                f" --per_fs {_ic_per_fs} --max_per_fs {_ic_max_per_fs}"
             )
         elif _env == "swe_infinite":
             _steps.append(f"python -m our_envs.swe_trajectories --output_path {_out}")
