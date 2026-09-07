@@ -17,6 +17,10 @@ SELFTEST_SEEDS="${SELFTEST_SEEDS:-40}"
 IMAGE="${IMAGE:-agulenv-trainer}"
 INTERCODE_DIR="${INTERCODE_DIR:-/opt/intercode}"
 HF_TOKEN="${HF_TOKEN:-}"
+BASE_MODEL="${BASE_MODEL:-}"          # only needed if a LoRA dir lacks adapter_config.json
+OUT_JSON="${OUT_JSON:-hasil_intercode.json}"   # rename so an A/B run does not clobber the other arm
+SKIP_SELFTEST="${SKIP_SELFTEST:-0}"   # gold gate already passed on this box? set 1 to save ~10 min
+LABEL="${LABEL:-}"                    # printed in the banner, e.g. "cap lama" / "cap baru"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO_ROOT/eval_out"
@@ -33,6 +37,18 @@ TASKS="$INTERCODE_DIR/data/nl2bash/nl2bash_fs_1.json \
        $INTERCODE_DIR/data/nl2bash/nl2bash_fs_2.json \
        $INTERCODE_DIR/data/nl2bash/nl2bash_fs_4.json"
 
+# A locally trained checkpoint lives on the host (outputs/<task_id>/<repo_name>);
+# the container cannot see it unless we mount it at the same path.
+MODEL_MOUNT=()
+if [ -d "$MODEL" ]; then
+    MODEL_ABS="$(cd "$MODEL" && pwd)"
+    MODEL_MOUNT=(-v "$MODEL_ABS:$MODEL_ABS:ro")
+    MODEL="$MODEL_ABS"
+    echo "    model lokal -> mount $MODEL_ABS"
+fi
+BASE_FLAG=()
+[ -n "$BASE_MODEL" ] && BASE_FLAG=(--base-model "$BASE_MODEL")
+
 run_in_image() {  # run_in_image <extra docker args> -- <python args...>
     local dockerargs=() ; while [ "$1" != "--" ]; do dockerargs+=("$1"); shift; done; shift
     docker run --rm --gpus all \
@@ -41,6 +57,7 @@ run_in_image() {  # run_in_image <extra docker args> -- <python args...>
         -e HF_TOKEN="$HF_TOKEN" -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
         -e HF_HUB_ENABLE_HF_TRANSFER=0 \
         -v "$HF_CACHE:/root/.cache/huggingface" \
+        "${MODEL_MOUNT[@]}" \
         "${dockerargs[@]}" --entrypoint bash "$IMAGE" -lc \
         "source /workspace/.grpo_env/bin/activate && cd /workspace/scripts && python -m tools.eval_intercode_local $*"
 }
@@ -68,6 +85,9 @@ else
         -f "$REPO_ROOT/dockerfiles/standalone-text-trainer.dockerfile" "$REPO_ROOT"
 fi
 
+if [ "$SKIP_SELFTEST" = "1" ]; then
+    echo "=== 3/4 swa-uji DILEWATI (SKIP_SELFTEST=1) ==="
+else
 echo "=== 3/4 swa-uji: policy gold harus ~1.0000 ==="
 # Gold runs the reference command and submits. Anything below ~0.99 means the
 # harness is wrong on THIS machine -- almost always fs_1/fs_2 snapshot restore
@@ -86,18 +106,19 @@ if awk "BEGIN{exit !($GOLD < 0.99)}"; then
     exit 1
 fi
 echo "    OK, harness jujur."
+fi
 
 echo "=== 4/4 skor model ==="
-echo "    model: $MODEL"
-run_in_image -- --policy hf --model "$MODEL" --tasks $TASKS --print-prompt \
+echo "    model: $MODEL${LABEL:+   [$LABEL]}"
+run_in_image -- --policy hf --model "$MODEL" --tasks $TASKS "${BASE_FLAG[@]}" --print-prompt \
     2>&1 | tee "$OUT/prompt.log" | tail -40
 
 run_in_image -- --policy hf --model "$MODEL" --tasks $TASKS \
-    --num-seeds "$NUM_SEEDS" --json /out/hasil_intercode.json 2>&1 | tee "$OUT/eval.log"
+    --num-seeds "$NUM_SEEDS" "${BASE_FLAG[@]}" --json "/out/$OUT_JSON" 2>&1 | tee "$OUT/eval.log"
 
 echo
 echo "=== lima task terburuk ==="
-python3 - "$OUT/hasil_intercode.json" <<'PY' 2>/dev/null || echo "    (lewati: butuh python3 di host)"
+python3 - "$OUT/$OUT_JSON" <<'PY' 2>/dev/null || echo "    (lewati: butuh python3 di host)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 rows = sorted(d.get("tasks", []), key=lambda r: r["reward"])[:5]
