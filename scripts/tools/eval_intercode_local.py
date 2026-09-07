@@ -371,8 +371,15 @@ POLICIES = {"gold": GoldPolicy, "noop": NoopPolicy, "hf": HFPolicy}
 
 
 # --------------------------------------------------------------- rollouts ---
-def run_episode(policy, task, env, max_turns: int) -> str:
-    """Play one task. Returns the FINAL observation -- what p3 is scored on."""
+def run_episode(policy, task, env, max_turns: int) -> "tuple[str, list]":
+    """Play one task.
+
+    Returns (final observation, turn history). p3 is scored on the final
+    observation alone, but the score says only how badly a task went, never
+    why -- the commands are the only thing that distinguishes "emitted no tool
+    call", "emitted invalid bash", and "ran fine but looked at the wrong
+    thing". Those three want completely different fixes, so carry the trace.
+    """
     env.reset(task["query"])
     history: list = []
     last_obs = ""
@@ -392,7 +399,7 @@ def run_episode(policy, task, env, max_turns: int) -> str:
         obs = env.step(cmd)
         last_obs = obs
         history.append({"cmd": cmd, "raw": raw or f'execute_bash(command="{cmd}")', "obs": obs})
-    return last_obs
+    return last_obs, history
 
 
 def main() -> int:
@@ -466,13 +473,15 @@ def main() -> int:
         t = time.time(); gold_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
 
         t = time.time()
-        agent_obs = run_episode(policy, task, env, args.max_turns)
+        agent_obs, trace = run_episode(policy, task, env, args.max_turns)
         spent["agent"] += time.time() - t
         t = time.time(); agent_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
 
         sc = score_task(agent_obs, gold_obs, agent_fs, gold_fs, base_fs, args.p2_empty)
         sc.update(query=task["query"], gold=task["gold"], fs=fs_v,
-                  agent_obs=agent_obs[:400], gold_obs=gold_obs[:400])
+                  agent_obs=agent_obs[:400], gold_obs=gold_obs[:400],
+                  turns=len(trace),
+                  trace=[{"cmd": h["cmd"], "obs": (h["obs"] or "")[:200]} for h in trace])
         rows.append(sc)
         if args.json:
             Path(args.json).write_text(json.dumps({"tasks": rows}, indent=2))
