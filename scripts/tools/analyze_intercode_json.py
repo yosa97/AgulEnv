@@ -39,6 +39,25 @@ SYNTAX_MARKERS = (
 
 
 def bucket(row: dict) -> str:
+    # A JSON written before traces were recorded has no "trace" key at all.
+    # Guessing from the final observation alone is much weaker -- it cannot
+    # tell a silent turn from no turn -- so say so rather than reporting
+    # every task as "no turn at all".
+    if "trace" not in row:
+        obs = (row.get("agent_obs") or "")
+        sim = row.get("similarity", 0.0)
+        if sim > 0.999:
+            return "solved"
+        if obs == "Invalid tool call.":
+            return "never emitted a valid tool call"
+        if any(m in obs for m in SYNTAX_MARKERS):
+            return "bash was malformed"
+        if not obs.strip():
+            return "ran, printed nothing"
+        if sim >= 0.5:
+            return "near miss (sim >= 0.5)"
+        return "ran cleanly, wrong output"
+
     trace = row.get("trace") or []
     cmds = [t for t in trace if t.get("cmd")]
     sim = row.get("similarity", 0.0)
@@ -66,6 +85,10 @@ def report(path: Path) -> dict:
         print(f"{path}: no tasks")
         return {}
     n = len(rows)
+    if not any("trace" in r for r in rows):
+        print(f"\n  CATATAN: {path.name} ditulis sebelum trace direkam, jadi")
+        print( "           bucket di bawah ditebak dari observasi terakhir saja.")
+        print( "           Skor ulang (2 menit) untuk analisis penuh.")
     counts: Counter = Counter()
     lost: Counter = Counter()
     for r in rows:
