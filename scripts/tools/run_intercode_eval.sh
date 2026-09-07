@@ -22,6 +22,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="$REPO_ROOT/eval_out"
 mkdir -p "$OUT"; chmod 777 "$OUT"
 
+# The image sets HF_HUB_ENABLE_HF_TRANSFER=1 but does not ship hf_transfer, so
+# any download aborts with a ValueError before it starts; turn it off.
+# The cache is mounted from the host so a 3B model is fetched once, not once
+# per run.
+HF_CACHE="${HF_CACHE:-$REPO_ROOT/secure_checkpoints/hf_cache}"
+mkdir -p "$HF_CACHE"; chmod 777 "$HF_CACHE"
+
 TASKS="$INTERCODE_DIR/data/nl2bash/nl2bash_fs_1.json \
        $INTERCODE_DIR/data/nl2bash/nl2bash_fs_2.json \
        $INTERCODE_DIR/data/nl2bash/nl2bash_fs_4.json"
@@ -32,6 +39,8 @@ run_in_image() {  # run_in_image <extra docker args> -- <python args...>
         -v "$INTERCODE_DIR:$INTERCODE_DIR:ro" -v "$OUT:/out" \
         -v "$REPO_ROOT/scripts:/workspace/scripts:ro" \
         -e HF_TOKEN="$HF_TOKEN" -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
+        -e HF_HUB_ENABLE_HF_TRANSFER=0 \
+        -v "$HF_CACHE:/root/.cache/huggingface" \
         "${dockerargs[@]}" --entrypoint bash "$IMAGE" -lc \
         "source /workspace/.grpo_env/bin/activate && cd /workspace/scripts && python -m tools.eval_intercode_local $*"
 }
