@@ -90,8 +90,12 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHECKPOINTS_DIR="$REPO_ROOT/secure_checkpoints"
 OUTPUTS_DIR="$REPO_ROOT/outputs"
-mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
-chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
+# The trainer writes every log, the merged dataset and the training request
+# into /workspace/scripts/datasets. The container is --rm, so without this
+# mount a failed run takes its own explanation to the grave.
+LOGS_DIR="$REPO_ROOT/train_logs"
+mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$LOGS_DIR"
+chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$LOGS_DIR"
 
 echo "=== RESOLVED SETTINGS ==="
 echo "    games : $GAMES"
@@ -195,6 +199,7 @@ docker run --rm --gpus all --network "$NET" \
     --memory=64g --cpus=8 \
     --volume "$CHECKPOINTS_DIR:/cache:rw" \
     --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
+    --volume "$LOGS_DIR:/workspace/scripts/datasets:rw" \
     -e ENVIRONMENT_SERVER_URLS="$ENV_URL" \
     -e GEN_CHUNK="$GEN_CHUNK" -e STEP_WORKERS="$STEP_WORKERS" \
     "${ENV_FLAGS[@]}" \
