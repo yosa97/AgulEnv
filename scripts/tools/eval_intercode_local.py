@@ -228,38 +228,96 @@ class NoopPolicy:
 
 
 class HFPolicy:
-    """The real thing: the trained model, rendered exactly as training did.
+    """The trained model, rendered EXACTLY as the SFT rows were.
 
-    Same chat template and same `tools` block the SFT rows carry, because a
-    prefix that differs from the one the model was trained on is the whole
-    forfeit bug class this repo has fought before.
+    intercode_tool_format builds each row as a flat three-message turn -- system,
+    one user message with the whole prior history folded in as TEXT lines, and
+    one assistant tool_call -- not a growing multi-turn conversation. Rebuilding
+    it as alternating assistant/user turns would feed the model a prefix it never
+    saw in training, which is the exact train/eval mismatch this repo has fought
+    before. So the prompt is built by CALLING the training helpers rather than
+    re-implementing them: byte-identical by construction, and it stays that way
+    if those helpers change.
+
+    A LoRA adapter repo is detected and layered onto its base model, since that
+    is what the tournament publishes for a LoRA run.
     """
 
     name = "hf"
 
-    def __init__(self, model: str, max_tokens: int = MAX_TOKENS_PER_CALL, **_):
+    def __init__(self, model: str, max_tokens: int = MAX_TOKENS_PER_CALL,
+                 base_model: str | None = None, dtype: str = "auto", **_):
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from our_envs.intercode_tool_format import INTERCODE_TOOLS
+        from our_envs.intercode_tool_format import (  # noqa: F401
+            INTERCODE_TOOL_SYSTEM_PROMPT,
+            INTERCODE_TOOLS,
+            _history_tool_line,
+            _user_prompt,
+        )
 
-        self.tools = INTERCODE_TOOLS
+        self._sys = INTERCODE_TOOL_SYSTEM_PROMPT
+        self._tools = INTERCODE_TOOLS
+        self._hist_line = _history_tool_line
+        self._user_prompt = _user_prompt
         self.max_tokens = max_tokens
-        self.tok = AutoTokenizer.from_pretrained(model)
-        self.model = AutoModelForCausalLM.from_pretrained(model, device_map="auto")
+        self.torch = torch
+
+        adapter = self._adapter_base(model)
+        base = base_model or adapter
+        torch_dtype = getattr(torch, dtype) if dtype not in ("auto", None) else "auto"
+
+        if base:
+            print(f"[eval] LoRA adapter detected; base = {base}")
+            from peft import PeftModel
+
+            self.tok = AutoTokenizer.from_pretrained(base)
+            inner = AutoModelForCausalLM.from_pretrained(
+                base, dtype=torch_dtype, device_map="auto"
+            )
+            self.model = PeftModel.from_pretrained(inner, model)
+        else:
+            self.tok = AutoTokenizer.from_pretrained(model)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model, dtype=torch_dtype, device_map="auto"
+            )
         self.model.eval()
 
-    def act(self, task, history):
-        import torch
+    @staticmethod
+    def _adapter_base(model: str) -> "str | None":
+        """Return the base model name if `model` is a PEFT adapter, else None."""
+        cfg = None
+        local = Path(model) / "adapter_config.json"
+        if local.is_file():
+            cfg = json.loads(local.read_text())
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
 
-        msgs = [{"role": "user", "content": task["query"]}]
-        for turn in history:
-            msgs.append({"role": "assistant", "content": turn["raw"]})
-            msgs.append({"role": "user", "content": f"Observation: {turn['obs']}"})
+                cfg = json.loads(Path(hf_hub_download(model, "adapter_config.json")).read_text())
+            except Exception:
+                return None
+        return (cfg or {}).get("base_model_name_or_path")
+
+    def render(self, task, history) -> list:
+        """The exact message list a training row for this turn would have had."""
+        lines: list = []
+        for i, turn in enumerate(history, 1):
+            lines.append(self._hist_line(i, turn.get("cmd")))
+            lines.append(f"Observation {i}: {turn['obs']}")
+        return [
+            {"role": "system", "content": self._sys},
+            {"role": "user", "content": self._user_prompt(task["query"], lines, len(history) + 1)},
+        ]
+
+    def act(self, task, history):
+        msgs = self.render(task, history)
         ids = self.tok.apply_chat_template(
-            msgs, tools=self.tools, tokenize=True,
+            msgs, tools=self._tools, tokenize=True,
             add_generation_prompt=True, return_tensors="pt",
         ).to(self.model.device)
-        with torch.no_grad():
+        with self.torch.no_grad():
             out = self.model.generate(
                 ids, max_new_tokens=self.max_tokens, do_sample=False,
                 pad_token_id=self.tok.pad_token_id or self.tok.eos_token_id,
@@ -320,12 +378,12 @@ def run_episode(policy, task, env, max_turns: int) -> str:
         if kind == "submit":
             break
         if kind != "execute_bash" or not cmd:
-            history.append({"raw": raw or "", "obs": "Invalid tool call."})
+            history.append({"cmd": None, "raw": raw or "", "obs": "Invalid tool call."})
             last_obs = "Invalid tool call."
             continue
         obs = env.step(cmd)
         last_obs = obs
-        history.append({"raw": raw or f'execute_bash(command="{cmd}")', "obs": obs})
+        history.append({"cmd": cmd, "raw": raw or f'execute_bash(command="{cmd}")', "obs": obs})
     return last_obs
 
 
@@ -340,6 +398,12 @@ def main() -> int:
     ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS_PER_CALL)
     ap.add_argument("--p2-empty", default="full", choices=("full", "zero"))
+    ap.add_argument("--base-model", default=None,
+                    help="base model for a LoRA adapter (auto-detected if omitted)")
+    ap.add_argument("--dtype", default="auto", help="bfloat16 / float16 / auto")
+    ap.add_argument("--print-prompt", action="store_true",
+                    help="render the first prompt, print it, and exit -- check the "
+                         "prefix matches training before spending GPU time")
     ap.add_argument("--json", default=None, help="write per-task detail here")
     args = ap.parse_args()
 
@@ -350,7 +414,23 @@ def main() -> int:
     )
 
     tasks = load_tasks(args.tasks, args.num_seeds, args.seed)
-    policy = POLICIES[args.policy](model=args.model, max_tokens=args.max_tokens)
+    policy = POLICIES[args.policy](
+        model=args.model, max_tokens=args.max_tokens,
+        base_model=args.base_model, dtype=args.dtype,
+    )
+
+    if args.print_prompt:
+        if not hasattr(policy, "render"):
+            print(f"[eval] policy '{policy.name}' builds no prompt")
+            return 0
+        msgs = policy.render(tasks[0], [])
+        print("=== turn 1, no history ===")
+        for m in msgs:
+            print(f"--- {m['role']} ---\n{m['content']}")
+        msgs = policy.render(tasks[0], [{"cmd": "ls -la", "obs": "total 0"}])
+        print("\n=== turn 2, one command behind ===")
+        print(f"--- user ---\n{msgs[1]['content']}")
+        return 0
     print(f"[eval] policy={policy.name} tasks={len(tasks)} max_turns={args.max_turns}")
 
     rows: list = []
