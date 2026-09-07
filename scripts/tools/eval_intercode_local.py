@@ -40,6 +40,7 @@ import os
 import random
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -435,6 +436,11 @@ def main() -> int:
 
     rows: list = []
     skipped = 0
+    # Where the wall clock goes. A 200-task run is long enough that "it is
+    # still running" needs an answer, and long enough to be worth not losing:
+    # the JSON is rewritten after every task, so a killed run keeps its rows.
+    spent = {"gold": 0.0, "agent": 0.0, "fs": 0.0}
+    t_start = time.time()
     for i, task in enumerate(tasks, 1):
         fs_v = task.get("fs") or detect_fs_for_gold(task["gold"])
         if fs_v not in (1, 2, 4) or not is_safe_for_real_exec(task["gold"]):
@@ -448,19 +454,26 @@ def main() -> int:
             continue
 
         env.reset(task["query"])
-        base_fs = snapshot_fs(env.managed_paths)
-        gold_obs = env.step(task["gold"])
-        gold_fs = snapshot_fs(env.managed_paths)
+        t = time.time(); base_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
+        t = time.time(); gold_obs = env.step(task["gold"]); spent["gold"] += time.time() - t
+        t = time.time(); gold_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
 
+        t = time.time()
         agent_obs = run_episode(policy, task, env, args.max_turns)
-        agent_fs = snapshot_fs(env.managed_paths)
+        spent["agent"] += time.time() - t
+        t = time.time(); agent_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
 
-        s = score_task(agent_obs, gold_obs, agent_fs, gold_fs, base_fs, args.p2_empty)
-        s.update(query=task["query"], gold=task["gold"], fs=fs_v)
-        rows.append(s)
+        sc = score_task(agent_obs, gold_obs, agent_fs, gold_fs, base_fs, args.p2_empty)
+        sc.update(query=task["query"], gold=task["gold"], fs=fs_v,
+                  agent_obs=agent_obs[:400], gold_obs=gold_obs[:400])
+        rows.append(sc)
+        if args.json:
+            Path(args.json).write_text(json.dumps({"tasks": rows}, indent=2))
         if i % 10 == 0 or i == len(tasks):
             mean = sum(r["reward"] for r in rows) / len(rows)
-            print(f"[eval] {i}/{len(tasks)}  running mean reward {mean:.4f}")
+            el = time.time() - t_start
+            eta = el / i * (len(tasks) - i)
+            print(f"[eval] {i}/{len(tasks)}  mean {mean:.4f}  elapsed {el/60:.1f}m  eta {eta/60:.1f}m")
 
     if not rows:
         print("[eval] no scorable tasks")
@@ -477,6 +490,12 @@ def main() -> int:
     print(f"  perfect answers      : {sum(1 for r in rows if r['similarity'] > 0.999)}/{n}")
     print(f"  zero answers         : {sum(1 for r in rows if r['similarity'] < 0.001)}/{n}")
     print(f"  extra fs changes     : {sum(r['diff_extra'] for r in rows)} across all tasks")
+    # The number that turns a score into an action: tasks where the answer was
+    # on screen at some point and the LAST observation no longer matches it.
+    burned = sum(1 for r in rows if r["similarity"] < 0.5)
+    print(f"  answers not matched  : {burned}/{n}  (worth up to {0.33 * burned / n:.4f} mean reward)")
+    print(f"  time: agent {spent['agent']/60:.1f}m | gold {spent['gold']/60:.1f}m | "
+          f"fs-hash {spent['fs']/60:.1f}m | total {(time.time()-t_start)/60:.1f}m")
 
     if args.json:
         Path(args.json).write_text(json.dumps({"aggregate": agg, "tasks": rows}, indent=2))
