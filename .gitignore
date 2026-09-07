@@ -237,3 +237,6 @@ scripts/test_data
 CLAUDE.md
 .claude/
 
+
+train_logs/
+eval_out/
