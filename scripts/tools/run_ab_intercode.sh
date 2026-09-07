@@ -70,7 +70,26 @@ score_arm() {  # score_arm <tag> <task_id> <skip_selftest>
     if [ ! -d "$path" ]; then
         echo "    TIDAK ADA $path -- latihan arm ini gagal, lewati."; return 1
     fi
-    MODEL="$path" BASE_MODEL="$BASE_MODEL" HF_TOKEN="$HF_TOKEN" \
+    # text_trainer.py falls back to `add_random_noise.py <base> <submission_dir>`
+    # when training fails, which fills this directory with a FULL-WEIGHTS copy
+    # of the base model plus gaussian noise on the embeddings -- a directory
+    # that looks perfectly healthy and scores like garbage. A real checkpoint
+    # is a copied checkpoint-N dir and always carries loss.txt (written by
+    # CustomEvalSaveCallback); the noise fallback never does. Gate on that.
+    if [ ! -f "$path/loss.txt" ]; then
+        echo "    LATIHAN GAGAL untuk arm '$tag'."
+        echo "    $path tidak punya loss.txt -> isinya model dasar + noise"
+        echo "    (fallback add_random_noise.py), bukan hasil latihan."
+        echo "    Menskor ini tidak ada artinya. Cek log latihan dulu."
+        return 1
+    fi
+    echo "    loss.txt: $(cat "$path/loss.txt")"
+    # Only an adapter needs a base named for it; a full-weights checkpoint
+    # loads on its own and passing one is how the first run died.
+    local bm=""
+    [ -f "$path/adapter_config.json" ] && bm="$BASE_MODEL"
+    echo "    isi checkpoint:"; ls "$path" | sed 's/^/      /'
+    MODEL="$path" BASE_MODEL="$bm" HF_TOKEN="$HF_TOKEN" \
     NUM_SEEDS="$NUM_SEEDS" OUT_JSON="ab_$tag.json" LABEL="$tag" \
     SKIP_SELFTEST="$skip" \
     bash "$REPO_ROOT/scripts/tools/run_intercode_eval.sh"

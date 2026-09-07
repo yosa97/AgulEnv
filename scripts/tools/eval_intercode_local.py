@@ -266,7 +266,14 @@ class HFPolicy:
         self.torch = torch
 
         adapter = self._adapter_base(model)
-        base = base_model or adapter
+        # --base-model is an OVERRIDE for an adapter whose config names the
+        # wrong base, not a declaration that `model` is an adapter.  Passing it
+        # for a full-weights checkpoint used to force the PEFT branch and die
+        # on a missing adapter_config.json; decide on the checkpoint itself.
+        is_adapter = adapter is not None or (Path(model) / "adapter_config.json").is_file()
+        if base_model and not is_adapter:
+            print(f"[eval] --base-model diabaikan: {model} adalah model penuh, bukan adapter")
+        base = (base_model or adapter) if is_adapter else None
         torch_dtype = getattr(torch, dtype) if dtype not in ("auto", None) else "auto"
 
         if base:
