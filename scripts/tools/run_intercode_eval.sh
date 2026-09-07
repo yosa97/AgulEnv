@@ -30,6 +30,7 @@ run_in_image() {  # run_in_image <extra docker args> -- <python args...>
     local dockerargs=() ; while [ "$1" != "--" ]; do dockerargs+=("$1"); shift; done; shift
     docker run --rm --gpus all \
         -v "$INTERCODE_DIR:$INTERCODE_DIR:ro" -v "$OUT:/out" \
+        -v "$REPO_ROOT/scripts:/workspace/scripts:ro" \
         -e HF_TOKEN="$HF_TOKEN" -e HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
         "${dockerargs[@]}" --entrypoint bash "$IMAGE" -lc \
         "source /workspace/.grpo_env/bin/activate && cd /workspace/scripts && python -m tools.eval_intercode_local $*"
@@ -44,9 +45,16 @@ else
 fi
 
 echo "=== 2/4 trainer image ==="
-if [ "${SKIP_BUILD:-0}" = "1" ] || docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "    memakai image '$IMAGE' yang ada (SKIP_BUILD=0 untuk build ulang)"
+# The image bakes `COPY scripts /workspace/scripts` at build time, so a
+# prebuilt image carries whatever the repo looked like THEN -- which is how a
+# freshly added tool ends up as "No module named tools.eval_intercode_local".
+# Mounting the working tree over that path instead means the container always
+# runs current code and the image never needs rebuilding for a script change.
+# Only the venv (/workspace/.grpo_env, a sibling path) comes from the image.
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "    image '$IMAGE' ada; scripts/ di-mount dari working tree (tanpa rebuild)"
 else
+    echo "    image '$IMAGE' belum ada -- build sekali (beberapa menit)"
     DOCKER_BUILDKIT=1 docker build -t "$IMAGE" \
         -f "$REPO_ROOT/dockerfiles/standalone-text-trainer.dockerfile" "$REPO_ROOT"
 fi
