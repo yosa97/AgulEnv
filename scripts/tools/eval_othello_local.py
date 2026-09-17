@@ -1,37 +1,28 @@
 #!/usr/bin/env python3
-"""Score a model on a PvP board game the way the validator does: vs MCTS.
+"""Score a model on a PvP board game the way the validator does.
 
-Half of every task in this tournament is othello, and until now that half was
-invisible -- every measurement we had was intercode.  This closes it.
+The validator's PvP metric is MODEL vs MODEL: it plays each pair of miners in
+a group head to head (16 games a pair in the tournament we replayed) and ranks
+them on that. So --opponent takes another model and that is the real thing;
+--opponent mcts (an in-process OpenSpiel MCTSBot at the game's eval simulation
+count) is the standing ladder to measure against when no rival model is at
+hand -- useful, but a proxy, and worth saying so out loud.
 
-The opponent is an in-process OpenSpiel MCTSBot with RandomRolloutEvaluator
-(n_rollouts=1) at the game's EVAL simulation count, which is what
-ENVIRONMENTS[<env>].eval_payload_extra pins validator-side (othello, clobber,
-leduc, gin: 50; liars_dice: 225).  Training samples a BAND around that value
-for state variety; a measurement must not, so the count is fixed here.
-
-The prompt is built by the same functions the SFT rows are built from
+Prompts are built by the same functions that build the SFT rows
 (build_system_prompt + toolcall_user_prompt_from_reformatted + the per-turn
-game_action schema), so what the model sees here is byte-aligned with what it
-saw in training and with what it will see at eval.
+game_action schema), so what a model sees here matches training and eval.
 
-Three policies:
-  hf       the model under test
-  random   the floor -- uniform over legal moves
-  teacher  the canonical expert used to LABEL the SFT data.  This is the
-           harness gate: if the teacher cannot beat MCTS at eval strength,
-           the measurement is broken (or the teacher is), and a model score
-           on top of it means nothing.
+Every seed is played from BOTH seats, so first-move advantage cancels exactly.
 
-Invalid output is NOT silently repaired into a good move.  A turn with no
-parseable game_action, or with an illegal id, is counted and reported on its
-own line, because "plays legal but weak moves" and "cannot emit a tool call"
-are different diseases with different cures.  --on-invalid decides whether
-the game then continues on a random legal move (default, so move quality
-stays measurable) or is scored as an immediate loss (what eval does).
+Invalid output is counted, never silently repaired into a good move: a turn
+with no parseable game_action and a turn with an illegal id get their own
+lines, because "cannot emit a tool call" and "plays legal but weak moves" are
+different diseases. --on-invalid decides whether the game then continues on a
+random legal move (default, so move quality stays measurable) or is scored an
+immediate loss (what eval does).
 
-    python -m tools.eval_othello_local --policy teacher --games 20
-    python -m tools.eval_othello_local --policy hf --model <path> --games 40
+    python -m tools.eval_othello_local --policy teacher --games 8
+    python -m tools.eval_othello_local --policy <modelA> --opponent <modelB>
 """
 from __future__ import annotations
 
@@ -207,69 +198,89 @@ class HFPolicy:
 POLICIES = {"hf": HFPolicy, "random": RandomPolicy, "teacher": TeacherPolicy}
 
 
+class MCTSPolicy:
+    """The MCTS opponent, wrapped so both seats go through one interface. The
+    bot is per-game (it carries search state), so it travels in the job."""
+    name = "mcts"
+
+    def __init__(self, **_):
+        pass
+
+    def act_batch(self, jobs):
+        from our_envs.mcts_opponent import mcts_step_or_none
+        out = []
+        for j in jobs:
+            a = mcts_step_or_none(j["bot"], j["state"])
+            out.append((a, "mcts") if a is not None else (None, "mcts gagal"))
+        return out
+
+
 # ----------------------------------------------------------------- cohort ---
 class Game:
-    """One game in flight. Seat is fixed by the caller, not sampled, so every
-    seed is played from both seats and seat advantage cancels out."""
+    """One game in flight between side A and side B.
 
-    def __init__(self, env_name: str, seed: int, seat: int, sims: int, max_turn: int):
+    Seats are assigned by the caller, not sampled, so every seed is played
+    from both seats and first-move advantage cancels out exactly.
+    """
+
+    def __init__(self, env_name: str, seed: int, a_seat: int, sims: int, max_turn: int,
+                 need_bot: bool):
         from our_envs.pvp_selfplay import _config_id_for_seed, _load_game, _setup_initial_state
-        from our_envs.mcts_opponent import make_mcts_bot
-        self.env_name, self.seed, self.seat = env_name, seed, seat
-        self.rng = random.Random(seed * 2 + seat)
+        self.env_name, self.seed, self.a_seat = env_name, seed, a_seat
+        self.rng = random.Random(seed * 2 + a_seat)
         self.game = _load_game(env_name, _config_id_for_seed(seed, env_name))
-        self.bot = make_mcts_bot(self.game, sims, seed)
+        self.bot = None
+        if need_bot:
+            from our_envs.mcts_opponent import make_mcts_bot
+            self.bot = make_mcts_bot(self.game, sims, seed)
         self.state = self.game.new_initial_state()
         _setup_initial_state(env_name, self.state, seed)
         self.max_turn = max_turn
         self.turns = 0
-        self.my_turns = 0
-        self.invalid = 0        # no parseable game_action
-        self.illegal = 0        # parsed, but not a legal id
-        self.hows: dict = {}
+        self.stats = {"a": {"turns": 0, "invalid": 0, "illegal": 0, "hows": {}},
+                      "b": {"turns": 0, "invalid": 0, "illegal": 0, "hows": {}}}
         self.done = False
-        self.score = None       # 1 win / 0.5 draw / 0 loss, from our seat
+        self.score = None       # 1 / 0.5 / 0, from A's seat
 
-    def advance_to_me(self):
-        """Run chance nodes and the opponent until it is our move, or the game
-        is over. Never raises out: a bad MCTS node degrades to a legal move."""
-        from our_envs.mcts_opponent import mcts_step_or_none
+    def side_to_move(self):
+        """Run chance and simultaneous nodes, then say whose turn it is:
+        "a", "b", or None when the game is over."""
         while not self.done:
             if self.state.is_terminal() or self.turns >= self.max_turn:
                 self.finish()
-                return
+                return None
             if self.state.is_chance_node():
                 acts, probs = zip(*self.state.chance_outcomes())
                 self.state.apply_action(self.rng.choices(list(acts), weights=list(probs), k=1)[0])
                 continue
+            if self.state.is_simultaneous_node():
+                # Defensive only: the simultaneous env (goofspiel) is refused up
+                # front. Never hang on an unexpected one.
+                joint = []
+                for pl in range(self.game.num_players()):
+                    lg = self.state.legal_actions(pl)
+                    joint.append(self.rng.choice(lg) if lg else 0)
+                self.state.apply_actions(joint)
+                self.turns += 1
+                continue
             cp = self.state.current_player()
-            if cp < 0:
+            if cp < 0 or not self.state.legal_actions(cp):
                 self.finish()
-                return
-            legal = self.state.legal_actions(cp)
-            if not legal:
-                self.finish()
-                return
-            if cp == self.seat:
-                return
-            a = mcts_step_or_none(self.bot, self.state)
-            if a is None or a not in legal:
-                a = self.rng.choice(legal)
-            self.state.apply_action(a)
-            self.turns += 1
+                return None
+            return "a" if cp == self.a_seat else "b"
+        return None
 
-    def apply(self, action, how: str, on_invalid: str):
-        legal = self.state.legal_actions(self.seat)
-        self.my_turns += 1
-        self.hows[how] = self.hows.get(how, 0) + 1
-        bad = action is None or action not in legal
-        if bad:
-            if action is None:
-                self.invalid += 1
-            else:
-                self.illegal += 1
+    def apply(self, side: str, action, how: str, on_invalid: str):
+        seat = self.a_seat if side == "a" else 1 - self.a_seat
+        legal = self.state.legal_actions(seat)
+        st = self.stats[side]
+        st["turns"] += 1
+        st["hows"][how] = st["hows"].get(how, 0) + 1
+        if action is None or action not in legal:
+            st["invalid" if action is None else "illegal"] += 1
             if on_invalid == "lose":
-                self.score, self.done = 0.0, True
+                self.score = 0.0 if side == "a" else 1.0
+                self.done = True
                 return
             action = self.rng.choice(legal)
         self.state.apply_action(action)
@@ -281,60 +292,102 @@ class Game:
             return
         self.done = True
         # An unfinished game is a draw: neither side earned the point, and
-        # calling it a loss would punish long games rather than bad ones.
-        self.score = _score(self.state.returns(), self.seat) if self.state.is_terminal() else 0.5
+        # scoring it a loss would punish long games rather than bad ones.
+        self.score = _score(self.state.returns(), self.a_seat) if self.state.is_terminal() else 0.5
 
 
-def run_cohort(policy, env_name, seeds, sims, max_turn, on_invalid, cohort, log_every):
-    games: list = []
-    t0 = time.time()
+def run_cohort(pa, pb, env_name, seeds, sims, max_turn, on_invalid, cohort, log_every):
+    """Play every seed from both seats, advancing a cohort in lockstep so each
+    side's turns batch into one generate() call instead of one per game."""
+    need_bot = isinstance(pa, MCTSPolicy) or isinstance(pb, MCTSPolicy)
     pending = [(s, seat) for s in seeds for seat in (0, 1)]
     total = len(pending)
+    live: list = []
     finished: list = []
-    while pending or games:
-        while pending and len(games) < cohort:
+    t0 = time.time()
+    while pending or live:
+        while pending and len(live) < cohort:
             s, seat = pending.pop(0)
-            g = Game(env_name, s, seat, sims, max_turn)
-            g.advance_to_me()
-            (finished if g.done else games).append(g)
-        if not games:
-            continue
-        jobs = [{"state": g.state, "player": g.seat, "legal": g.state.legal_actions(g.seat)} for g in games]
-        for g, (action, how) in zip(games, policy.act_batch(jobs)):
-            g.apply(action, how, on_invalid)
-            if not g.done:
-                g.advance_to_me()
+            live.append(Game(env_name, s, seat, sims, max_turn, need_bot))
+        buckets = {"a": [], "b": []}
+        for g in live:
+            side = g.side_to_move()
+            if side:
+                buckets[side].append(g)
+        for side, policy in (("a", pa), ("b", pb)):
+            gs = buckets[side]
+            if not gs:
+                continue
+            jobs = [{"state": g.state,
+                     "player": g.a_seat if side == "a" else 1 - g.a_seat,
+                     "legal": g.state.legal_actions(g.a_seat if side == "a" else 1 - g.a_seat),
+                     "bot": g.bot} for g in gs]
+            for g, (action, how) in zip(gs, policy.act_batch(jobs)):
+                g.apply(side, action, how, on_invalid)
         still, just = [], []
-        for g in games:
-            (just if g.done else still).append(g)
-        games, finished = still, finished + just
+        for g in live:
+            (just if (g.done or g.side_to_move() is None) else still).append(g)
+        live, finished = still, finished + just
         if just and log_every and len(finished) % log_every < len(just):
-            wr = sum(x.score for x in finished) / len(finished)
+            sc = sum(x.score for x in finished) / len(finished)
             el = time.time() - t0
-            eta = el / max(len(finished), 1) * (total - len(finished))
-            print(f"[eval] {len(finished)}/{total}  skor {wr:.3f}  "
-                  f"elapsed {el/60:.1f}m  eta {eta/60:.1f}m", flush=True)
+            print(f"[eval] {len(finished)}/{total}  skor A {sc:.3f}  "
+                  f"elapsed {el/60:.1f}m  eta {el/max(len(finished),1)*(total-len(finished))/60:.1f}m",
+                  flush=True)
     return finished
+
+
+def make_policy(spec: str, env_name: str, args, is_opponent: bool):
+    """A side is either a named policy (hf/random/teacher/mcts) or a model
+    path -- anything that is not a known name is taken as a model."""
+    if spec in POLICIES:
+        return POLICIES[spec](env_name=env_name, model=args.model,
+                              base_model=args.base_model, dtype=args.dtype,
+                              max_tokens=args.max_tokens, batch=args.batch)
+    if spec == "mcts":
+        return MCTSPolicy()
+    return HFPolicy(env_name=env_name, model=spec, base_model=args.base_model,
+                    dtype=args.dtype, max_tokens=args.max_tokens, batch=args.batch)
+
+
+def _side_report(rows, side: str, label: str, name: str):
+    turns = sum(g.stats[side]["turns"] for g in rows)
+    inv = sum(g.stats[side]["invalid"] for g in rows)
+    ill = sum(g.stats[side]["illegal"] for g in rows)
+    hows: dict = {}
+    for g in rows:
+        for k, v in g.stats[side]["hows"].items():
+            hows[k] = hows.get(k, 0) + v
+    print(f"  {label} ({name})")
+    print(f"    giliran           : {turns}")
+    print(f"    tanpa game_action : {inv} ({100*inv/max(turns,1):.1f}%)  <- forfeit di eval")
+    print(f"    id tidak legal    : {ill} ({100*ill/max(turns,1):.1f}%)")
+    for k, v in sorted(hows.items(), key=lambda kv: -kv[1])[:4]:
+        print(f"    bentuk jawaban    : {k:<26} {v:>6} ({100*v/max(turns,1):.1f}%)")
+    return {"turns": turns, "invalid": inv, "illegal": ill, "hows": hows}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--policy", default="teacher", choices=sorted(POLICIES))
+    ap.add_argument("--policy", default="teacher",
+                    help="side A: hf | random | teacher | mcts | a model path/repo")
+    ap.add_argument("--opponent", default="mcts",
+                    help="side B: mcts (default) | random | teacher | a model path/repo")
     ap.add_argument("--game", default="othello")
-    ap.add_argument("--model", default=None)
+    ap.add_argument("--model", default=None, help="model for --policy hf")
     ap.add_argument("--base-model", default=None)
     ap.add_argument("--dtype", default="auto")
-    ap.add_argument("--games", type=int, default=20, help="seeds; each is played from BOTH seats")
+    ap.add_argument("--games", type=int, default=8, help="seeds; each played from BOTH seats")
     ap.add_argument("--seed0", type=int, default=0)
-    ap.add_argument("--sims", type=int, default=None, help="override the eval simulation count")
+    ap.add_argument("--sims", type=int, default=None)
     ap.add_argument("--max-turn", type=int, default=80)
     ap.add_argument("--max-tokens", type=int, default=128)
-    ap.add_argument("--cohort", type=int, default=16, help="games advanced in lockstep")
-    ap.add_argument("--batch", type=int, default=16, help="prompts per generate() call")
+    ap.add_argument("--cohort", type=int, default=16)
+    ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--on-invalid", default="random", choices=("random", "lose"),
                     help="random: keep playing (move quality stays measurable); "
                          "lose: score the game 0 immediately (what eval does)")
-    ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument("--log-every", type=int, default=8)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
@@ -343,67 +396,49 @@ def main() -> int:
         return 1
     sims = args.sims if args.sims is not None else EVAL_SIMS.get(args.game, 50)
     if args.policy == "hf" and not args.model:
-        print("[eval] --policy hf butuh --model")
+        print("[eval] --policy hf butuh --model (atau beri path model langsung ke --policy)")
         return 1
 
-    policy = POLICIES[args.policy](
-        env_name=args.game, model=args.model, base_model=args.base_model,
-        dtype=args.dtype, max_tokens=args.max_tokens, batch=args.batch,
-    )
+    pa = make_policy(args.policy, args.game, args, False)
+    pb = make_policy(args.opponent, args.game, args, True)
+    name_a = args.model if args.policy == "hf" else args.policy
+    name_b = args.opponent
     seeds = list(range(args.seed0, args.seed0 + args.games))
-    print(f"[eval] game={args.game} policy={policy.name} lawan=MCTS@{sims} "
-          f"({len(seeds)} seed x 2 kursi = {2*len(seeds)} game) on-invalid={args.on_invalid}")
+    print(f"[eval] {args.game}: A={name_a}  vs  B={name_b}"
+          f"{f' @{sims} sims' if 'mcts' in (args.policy, args.opponent) else ''}  "
+          f"({len(seeds)} seed x 2 kursi = {2*len(seeds)} game)  on-invalid={args.on_invalid}")
 
     t0 = time.time()
-    rows = run_cohort(policy, args.game, seeds, sims, args.max_turn,
+    rows = run_cohort(pa, pb, args.game, seeds, sims, args.max_turn,
                       args.on_invalid, args.cohort, args.log_every)
     n = len(rows)
     if not n:
         print("[eval] tidak ada game")
         return 1
-
     wins = sum(1 for g in rows if g.score == 1.0)
     draws = sum(1 for g in rows if g.score == 0.5)
     losses = n - wins - draws
-    my_turns = sum(g.my_turns for g in rows)
-    invalid = sum(g.invalid for g in rows)
-    illegal = sum(g.illegal for g in rows)
-    hows: dict = {}
-    for g in rows:
-        for k, v in g.hows.items():
-            hows[k] = hows.get(k, 0) + v
 
-    print(f"\n=== {args.game} vs MCTS@{sims} ===")
-    print(f"  policy         : {policy.name}")
-    print(f"  game           : {n}")
-    print(f"  MENANG         : {wins}  ({100*wins/n:.1f}%)")
-    print(f"  seri           : {draws}  ({100*draws/n:.1f}%)")
-    print(f"  kalah          : {losses}  ({100*losses/n:.1f}%)")
-    print(f"  SKOR (w+.5d)   : {sum(g.score for g in rows)/n:.4f}")
-    print(f"  giliran kita   : {my_turns}")
-    print(f"    tanpa game_action : {invalid}  ({100*invalid/max(my_turns,1):.1f}%)  <- forfeit di eval")
-    print(f"    id tidak legal    : {illegal}  ({100*illegal/max(my_turns,1):.1f}%)")
-    for k, v in sorted(hows.items(), key=lambda kv: -kv[1]):
-        print(f"    bentuk jawaban    : {k:<28} {v:>6} ({100*v/max(my_turns,1):.1f}%)")
+    print(f"\n=== {args.game}: A vs B ===")
+    print(f"  A  : {name_a}")
+    print(f"  B  : {name_b}")
+    print(f"  {n} game  ->  A menang {wins}, seri {draws}, kalah {losses}")
+    print(f"  SKOR A (w+.5d) : {(wins + 0.5*draws)/n:.4f}")
+    sa = _side_report(rows, "a", "sisi A", str(name_a))
+    sb = _side_report(rows, "b", "sisi B", str(name_b))
     for seat in (0, 1):
-        sub = [g for g in rows if g.seat == seat]
+        sub = [g for g in rows if g.a_seat == seat]
         if sub:
-            print(f"  kursi P{seat}        : skor {sum(g.score for g in sub)/len(sub):.3f} "
-                  f"atas {len(sub)} game")
-    print(f"  waktu          : {(time.time()-t0)/60:.1f}m")
-    print("\n  patokan: 0.500 = seimbang dengan MCTS eval | random biasanya jauh di bawah")
-    print("           teacher harus jelas di atas 0.5, kalau tidak harness/teacher-nya rusak")
+            print(f"  A di kursi P{seat} : {sum(g.score for g in sub)/len(sub):.3f} atas {len(sub)} game")
+    print(f"  waktu : {(time.time()-t0)/60:.1f}m")
 
     if args.json:
         Path(args.json).write_text(json.dumps({
-            "game": args.game, "policy": policy.name, "sims": sims,
-            "n": n, "wins": wins, "draws": draws, "losses": losses,
-            "score": sum(g.score for g in rows) / n,
-            "my_turns": my_turns, "invalid": invalid, "illegal": illegal,
-            "hows": hows,
-            "games": [{"seed": g.seed, "seat": g.seat, "score": g.score,
-                       "my_turns": g.my_turns, "invalid": g.invalid,
-                       "illegal": g.illegal} for g in rows],
+            "game": args.game, "a": str(name_a), "b": str(name_b), "sims": sims,
+            "n": n, "a_wins": wins, "draws": draws, "b_wins": losses,
+            "a_score": (wins + 0.5 * draws) / n,
+            "a_side": sa, "b_side": sb,
+            "games": [{"seed": g.seed, "a_seat": g.a_seat, "score": g.score} for g in rows],
         }, indent=2))
         print(f"  detail -> {args.json}")
     return 0
