@@ -208,7 +208,7 @@ class GoldPolicy:
     def __init__(self, **_):
         self.done = set()
 
-    def act(self, task, history):
+    def act(self, task, history, allow_submit=True):
         key = id(task)
         if key in self.done:
             return ("submit", None)
@@ -224,7 +224,7 @@ class NoopPolicy:
     def __init__(self, **_):
         pass
 
-    def act(self, task, history):
+    def act(self, task, history, allow_submit=True):
         return ("submit", None)
 
 
@@ -319,10 +319,20 @@ class HFPolicy:
             {"role": "user", "content": self._user_prompt(task["query"], lines, len(history) + 1)},
         ]
 
-    def act(self, task, history):
+    def act(self, task, history, allow_submit=True):
         msgs = self.render(task, history)
+        # Withholding the submit tool is how --min-turns forces a second look.
+        # Re-asking with the same prompt would be pointless: generation is
+        # greedy, so the model would answer submit again, every time, until
+        # max_turns ran out -- a false negative dressed up as evidence. A
+        # per-turn tools list is also not off-distribution here; the PvP side
+        # of this repo varies its tools every turn already.
+        tools = self._tools if allow_submit else [
+            t for t in self._tools
+            if (t.get("function", {}).get("name") or t.get("name")) != "submit"
+        ]
         ids = self.tok.apply_chat_template(
-            msgs, tools=self._tools, tokenize=True,
+            msgs, tools=tools, tokenize=True,
             add_generation_prompt=True, return_tensors="pt",
         ).to(self.model.device)
         with self.torch.no_grad():
@@ -371,7 +381,7 @@ POLICIES = {"gold": GoldPolicy, "noop": NoopPolicy, "hf": HFPolicy}
 
 
 # --------------------------------------------------------------- rollouts ---
-def run_episode(policy, task, env, max_turns: int) -> "tuple[str, list]":
+def run_episode(policy, task, env, max_turns: int, min_turns: int = 0) -> "tuple[str, list]":
     """Play one task.
 
     Returns (final observation, turn history). p3 is scored on the final
@@ -383,14 +393,26 @@ def run_episode(policy, task, env, max_turns: int) -> "tuple[str, list]":
     env.reset(task["query"])
     history: list = []
     last_obs = ""
+    forced = 0
     for _ in range(max_turns):
-        res = policy.act(task, history)
+        allow_submit = len(history) >= min_turns
+        if not allow_submit:
+            forced += 1
+        res = policy.act(task, history, allow_submit=allow_submit)
         raw = ""
         if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], tuple):
             (kind, cmd), raw = res
         else:
             kind, cmd = res
         if kind == "submit":
+            # Refused only while the submit tool was withheld; a model that
+            # emits it anyway has ignored its tools list, which is worth
+            # seeing rather than silently overriding.
+            if not allow_submit:
+                history.append({"cmd": None, "raw": raw or "",
+                                "obs": "Invalid tool call."})
+                last_obs = "Invalid tool call."
+                continue
             break
         if kind != "execute_bash" or not cmd:
             history.append({"cmd": None, "raw": raw or "", "obs": "Invalid tool call."})
@@ -410,6 +432,8 @@ def main() -> int:
     ap.add_argument("--snapshot-root", default=DEFAULT_SNAPSHOT_ROOT)
     ap.add_argument("--num-seeds", type=int, default=25)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--min-turns", type=int, default=0,
+                    help="refuse submit before this many commands have run")
     ap.add_argument("--max-turns", type=int, default=MAX_TURNS)
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS_PER_CALL)
     ap.add_argument("--p2-empty", default="full", choices=("full", "zero"))
@@ -473,7 +497,7 @@ def main() -> int:
         t = time.time(); gold_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
 
         t = time.time()
-        agent_obs, trace = run_episode(policy, task, env, args.max_turns)
+        agent_obs, trace = run_episode(policy, task, env, args.max_turns, args.min_turns)
         spent["agent"] += time.time() - t
         t = time.time(); agent_fs = snapshot_fs(env.managed_paths); spent["fs"] += time.time() - t
 
